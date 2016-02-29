@@ -4,6 +4,24 @@
 new persistent SiteMgr class
 """
 
+# TODO for collaborative huge site support:
+# - new file state: needupload (but has CHK)
+# - only upload --max-size-per-call per update run (but at least 1 file). Default: None
+# - when --check-get-before-upload is set, before trying to upload an external file, try to get(key, nodata=True, realtime=True, timeout=(estimated))
+# - estimate timeout: 5MiB/minute. -> catch exception FCPSendTimeout -> queue upload.
+# - when --only-external-files is set, construct but do not upload the manifest.
+# - this gives us reinsert for free: mark all external files as needupload
+#
+# Master:
+# --max-size-per-call 100MiB
+# --check-get-before-upload
+#
+# Supporter(s):
+# --max-size-per-call 100MiB
+# --check-get-before-upload
+# --only-external-files
+
+
 #@+others
 #@+node:imports
 import sys, os, os.path, io, threading, traceback, pprint, time, stat, sha, json
@@ -1167,6 +1185,7 @@ class SiteState:
             self.sitemapUri = self.sitemapRec['uri']
         
 
+
         def createindex():
             # create an index.html with a directory listing
             title = "Freesite %s directory listing" % self.name,
@@ -1322,6 +1341,17 @@ class SiteState:
         Selects the files which should directly be put in the manifest and
         marks them with rec['target'] = 'manifest'. All other files
         are marked with 'separate'.
+        
+        Files are selected for the manifest until the manifest reaches 
+        maxManifestSizeBytes based on the following rules:
+        - index and activelink.png are always included
+        - the first to include are CSS files referenced in the index, smallest first
+        - then follow all other files referenced in the index, smallest first
+        - then follow html files not referenced in the index, smallest first
+        - then follow all other files, smallest first
+        
+        The manifest goes above the max size if that is necessary to avoid having more 
+        than maxNumberSeparateFiles redirects.
         """
         # TODO: This needs to avoid spots which break freenet. If we
         # have very many small files, they should all be put into the
@@ -1368,6 +1398,7 @@ class SiteState:
                 indexText = io.open(self.indexRec['path'], "r").read()
         # now resort the recBySize to have the recs which are
         # referenced in index first - with additional preference to CSS files.
+        # For files outside the index, prefer html files before others.
         fileNamesInIndex = set([rec['name'] for rec in recBySize 
                                 if rec['name'].decode("utf-8") in indexText])
         fileNamesInIndexCSS = set([rec['name'] for rec in recBySize 
@@ -1381,7 +1412,11 @@ class SiteState:
                                  if rec['name'].decode("utf-8") in fileNamesInIndex
                                  and rec['name'].decode("utf-8") not in fileNamesInIndexCSS)
         recByIndexAndSize.extend(rec for rec in recBySize 
-                                 if rec['name'].decode("utf-8") not in fileNamesInIndex)
+                                 if rec['name'].decode("utf-8") not in fileNamesInIndex
+                                 and rec['name'].decode("utf-8").lower().endswith(".html"))
+        recByIndexAndSize.extend(rec for rec in recBySize 
+                                 if rec['name'].decode("utf-8") not in fileNamesInIndex
+                                 and not rec['name'].decode("utf-8").lower().endswith(".html"))
         for rec in recByIndexAndSize:
             if rec is self.indexRec or rec is self.activelinkRec:
                 rec['target'] = 'manifest'
@@ -1422,7 +1457,8 @@ class SiteState:
                     "Identifier=%s" % self.manifestCmdId,
                     "Verbosity=%s" % self.Verbosity,
                     "MaxRetries=%s" % maxretries,
-                    "PriorityClass=%s" % self.priority,
+                    # lower by one to win against WoT. Avoids stalling site inserts.
+                    "PriorityClass=%s" % max(0, int(self.priority) - 1), 
                     "URI=%s" % self.uriPriv,
                     "Persistence=forever",
                     "Global=true",

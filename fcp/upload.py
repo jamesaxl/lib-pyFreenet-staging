@@ -73,10 +73,12 @@ def help():
                      "     Set the persistence type, one of 'connection', 'reboot' or 'forever'",
                      "  -g, --global",
                      "     Do it on the FCP global queue",
-                     "  -n, --nowait",
-                     "     Don't wait for completion, exit immediately",
+                     "  -w, --wait",
+                     "     Wait for completion",
                      "  -r, --priority",
                      "     Set the priority (0 highest, 6 lowest, default 3)",
+                     "  -e, --realtime",
+                     "     Use the realtime queue (fast for small files)",
                      "  -t, --timeout=",
                      "     Set the timeout, in seconds, for completion. Default one year",
                      "  -V, --version",
@@ -99,7 +101,7 @@ def main():
     fcpHost = node.defaultFCPHost
     fcpPort = node.defaultFCPPort
     mimetype = None
-    nowait = True
+    wait = False
 
     opts = {
             "Verbosity" : 0,
@@ -114,10 +116,10 @@ def main():
     try:
         cmdopts, args = getopt.getopt(
             sys.argv[1:],
-            "?hvH:P:m:gcdp:nr:t:V",
+            "?hvH:P:m:gcdp:wr:et:V",
             ["help", "verbose", "fcpHost=", "fcpPort=", "mimetype=", "global","compress","disk",
-             "persistence=", "nowait",
-             "priority=", "timeout=", "version",
+             "persistence=", "wait",
+             "priority=", "realtime", "timeout=", "version",
              ]
             )
     except getopt.GetoptError:
@@ -175,9 +177,9 @@ def main():
         elif o in ("-g", "--global"):
             opts['Global'] = "true"
 
-        elif o in ("-n", "--nowait"):
-            opts['async'] = True
-            nowait = True
+        elif o in ("-w", "--wait"):
+            opts['async'] = False
+            wait = True
 
         elif o in ("-r", "--priority"):
             try:
@@ -187,6 +189,9 @@ def main():
             except:
                 usage("Invalid priority '%s'" % pri)
             opts['priority'] = int(a)
+
+        elif o in ("-e", "--realtime"):
+            opts['realtime'] = True
 
         elif o in ("-t", "--timeout"):
             try:
@@ -244,6 +249,9 @@ def main():
     # FIXME: Throw out all the TestDDARequest stuff. It is not needed for putting a single file.
     TestDDARequest=False
 
+    #: The key of the uploaded file.
+    freenet_uri = None
+    
     if makeDDARequest:
         if infile is not None:
             ddareq=dict()
@@ -260,7 +268,7 @@ def main():
 
             if TestDDARequest:
                 opts["file"]=ddafile
-                uri = n.put(uri,**opts)
+                putres = n.put(uri,**opts)
             else:
                 sys.stderr.write("%s: disk access failed to insert file %s fallback to direct\n" % (progname,ddafile) )
         else:
@@ -281,10 +289,21 @@ def main():
         try:
             #print "opts=%s" % str(opts)
             # give it the file anyway: Put is more intelligent than this script.
+            opts["data"] = data
             if infile:
-                uri = n.put(uri, data=data, file=infile, **opts)
-            else:
-                uri = n.put(uri, data=data, **opts)
+                opts["file"] = infile
+            n.listenGlobal()
+            putres = n.put(uri, **opts)
+            if not wait:
+                opts["chkonly"] = True
+                opts["async"] = False
+                # force the node to be fast
+                opts["priority"] = 0
+                opts["realtime"] = True
+                opts["persistence"] = "connection"
+                opts["Global"] = False
+                freenet_uri = n.put(uri,**opts)
+
         except:
             if verbose:
                 traceback.print_exc(file=sys.stderr)
@@ -292,16 +311,19 @@ def main():
             sys.stderr.write("%s: Failed to insert key %s\n" % (progname, repr(uri)))
             sys.exit(1)
 
-        if nowait:
+        if not wait:
             # got back a job ticket, wait till it has been sent
-            uri.waitTillReqSent()
+            putres.waitTillReqSent()
         else:
             # successful, return the uri
-            sys.stdout.write(uri)
+            sys.stdout.write(putres)
             sys.stdout.flush()
 
     n.shutdown()
 
+    # output the key of the file
+    if not wait:
+        print freenet_uri
     # all done
     sys.exit(0)
 

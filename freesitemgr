@@ -175,7 +175,7 @@ def removeSite(sitemgr, sitename):
         print "No such freesite '%s'" % sitename
         return
 
-    if getyesno("Are you sure you wish to delete freesite '%s'" % sitename, False):
+    if getyesno("Are you sure you wish to delete the configuration (metadata and keys) for freesite '%s'" % sitename, False):
         sitemgr.removeSite(sitename)
         print "Removed freesite '%s'" % sitename
 
@@ -270,8 +270,7 @@ def help():
     print "  -l, --logfile=filename"
     print "          - location of logfile (default %s)" % logFile
     print "  -r, --priority"
-    print "     Set the priority (0 highest, 6 lowest, default 4)"
-    print "     of 'forever', so the insert will resume if the node crashes"
+    print "     Set the priority (0 highest, 6 lowest, default 3)"
     print "  -C, --cron"
     print "     Set options suitable for putting freesitemgr in your crontab,"
     print "     and output a dated header with each site insert"
@@ -295,7 +294,7 @@ def help():
     print "  list [<name>]      - display a summary of all freesites, or a"
     print "                       detailed report of one site if <name> given"
     print "  listall            - print detailed report of all sites"
-    print "  remove <name>      - remove given freesite"
+    print "  remove <name>      - remove metadata and keys for given freesite"
     print "  update [<name>...] - reinsert freesites which have changed since"
     print "                       they were last inserted. If no site names are"
     print "                       given, then all freesites will be updated"

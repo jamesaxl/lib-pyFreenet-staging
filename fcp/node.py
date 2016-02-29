@@ -586,7 +586,7 @@ class FCPNode:
             - dontcompress - do not compress on insert - default false
     
         Keywords for 'file', 'data' and 'redirect' modes:
-            - mimetype - the mime type, default text/plain
+            - mimetype - the mime type, default application/octet-stream
     
         Keywords valid for all modes:
             - async - whether to do the job asynchronously, returning a job ticket
@@ -603,6 +603,10 @@ class FCPNode:
               persistence must be 'reboot' or 'forever'
             - Verbosity - default 0 - sets the Verbosity mask passed in the
               FCP message - case-sensitive
+            - LocalRequestOnly - default False - whether to insert the data
+              into only the local datastore, instead of sending it into the
+              network. This does not allow others to fetch the data and is
+              only useful for testing purposes.
     
             - maxretries - maximum number of retries, default 3
             - priority - the PriorityClass for retrieval, default 3, may be between
@@ -631,16 +635,21 @@ class FCPNode:
     
         self._log(DETAIL, "put: uri=%s async=%s waituntilsent=%s" % (
                             uri, opts['async'], opts['waituntilsent']))
-    
+
         opts['Persistence'] = kw.pop('persistence', 'connection')
         if kw.get('Global', False):
             opts['Global'] = "true"
         else:
             opts['Global'] = "false"
-    
+        
         if opts['Global'] == 'true' and opts['Persistence'] == 'connection':
             raise Exception("Global requests must be persistent")
     
+
+        if kw.get('Global', False):
+            # listen to the global queue
+            self.listenGlobal()
+
         # process uri, including possible namesite lookups
         uri = uri.split("freenet:")[-1]
         if len(uri) < 4 or (uri[:4] not in ('SSK@', 'KSK@', 'CHK@', 'USK@', 'SVK@')):
@@ -699,6 +708,7 @@ class FCPNode:
         opts['DontCompress'] = toBool(kw.get("nocompress", "false"))
         opts['Codecs'] = kw.get('Codecs', 
                                 self.defaultCompressionCodecsString())
+        opts['LocalRequestOnly'] = kw.get('LocalRequestOnly', False)
         
         if kw.has_key("file"):
             filepath = os.path.abspath(kw['file'])
@@ -729,7 +739,18 @@ class FCPNode:
             
     
         opts['timeout'] = int(kw.get("timeout", ONE_YEAR))
-    
+
+        # if the mime-type is application/octet-stream, kill it to
+        # avoid forcing metadata creation
+        mime = opts.get('Metadata.ContentType', None)
+        if mime is not None:
+            if mime == "application/octet-stream":
+                del opts['Metadata.ContentType']
+
+        if "IgnoreUSKDatehints" in kw:
+            opts["IgnoreUSKDatehints"] = kw["IgnoreUSKDatehints"]
+        
+        
         #print "sendEnd=%s" % sendEnd
     
         # ---------------------------------
@@ -823,15 +844,20 @@ class FCPNode:
         else:
             maxConcurrent = 10
         
-        if kw.get('globalqueue', False):
+        if kw.get('globalqueue', False) or kw.get('Global', False):
             globalMode = True
             globalWord = "true"
             persistence = "forever"
+
         else:
             globalMode = False
             globalWord = "false"
             persistence = "connection"
-        
+
+        if kw.get('globalqueue', False) or kw.get('Global', False):
+            # listen to the global queue
+            self.listenGlobal()
+
         id = kw.pop("id", None)
         if not id:
             id = self._getUniqueId()
@@ -877,7 +903,9 @@ class FCPNode:
         
         #@-node:<<get inventory>>
         #@nl
-        
+
+        # FIXME: This somehow works, but it is borked and
+        # repeated. Clean it up. I bet I am the one responsible...
         #@    <<global mode>>
         #@+node:<<global mode>>
         if 0:
@@ -930,20 +958,10 @@ class FCPNode:
                             "PriorityClass=%s" % priority,
                             "URI=%s" % uriFull,
                             "Codecs=%s" % codecs,
-                            #"Persistence=%s" % kw.get("persistence", "connection"),
+                            "Persistence=%s" % persistence,
+                            "Global=%s" % globalWord,
                             "DefaultName=index.html",
                             ]
-                # support global queue option
-                if globalMode:
-                    msgLines.extend([
-                        "Persistence=forever",
-                        "Global=true",
-                        ])
-                else:
-                    msgLines.extend([
-                        "Persistence=connection",
-                        "Global=false",
-                        ])
                 
                 # add each file's entry to the command buffer
                 n = 0
@@ -988,7 +1006,7 @@ class FCPNode:
             log(INFO, "putdir: starting file-by-file inserts")
         
             lastProgressMsgTime = time.time()
-        
+
             # insert each file, one at a time
             nTotal = len(manifest)
         
@@ -1056,7 +1074,7 @@ class FCPNode:
                                chkonly=chkonly,
                                priority=priority,
                                Global=globalMode,
-                               Persistence=persistence,
+                               persistence=persistence,
                                )
                 jobs.append(job)
                 filerec['job'] = job
@@ -1085,20 +1103,10 @@ class FCPNode:
                     "PriorityClass=%s" % priority,
                     "URI=%s" % uriFull,
                     "Codecs=%s" % codecs,
-                    #"Persistence=%s" % kw.get("persistence", "connection"),
+                    "Persistence=%s" % persistence,
+                    "Global=%s" % globalWord,
                     "DefaultName=index.html",
                     ]
-        # support global queue option
-        if kw.get('Global', False):
-            msgLines.extend([
-                "Persistence=forever",
-                "Global=true",
-                ])
-        else:
-            msgLines.extend([
-                "Persistence=connection",
-                "Global=false",
-                ])
         
         # add each file's entry to the command buffer
         n = 0
@@ -1156,9 +1164,10 @@ class FCPNode:
                             id, "ClientPutComplexDir",
                             rawcmd=manifestInsertCmdBuf,
                             async=kw.get('async', False),
+                            Global=globalMode,
+                            persistence=persistence,
                             waituntilsent=kw.get('waituntilsent', False),
                             callback=kw.get('callback', False),
-                            #Persistence=kw.get('Persistence', 'connection'),
                             )
         
         #@-node:<<insert manifest>>
@@ -1329,7 +1338,7 @@ class FCPNode:
             - WithPrivate - default False - if True, includes the node's private node reference fields
             - WithVolatile - default False - if True, returns a node's volatile info
         """
-        
+        # The GetNode answer has no id, so we have to use __global.
         return self._submitCmd("__global", "GetNode", **kw)
     
     #@-node:refstats
@@ -2104,7 +2113,13 @@ class FCPNode:
         """
         if not self.nodeIsAlive:
             raise FCPNodeFailure("%s:%s: node closed connection" % (cmd, id))
-    
+
+        # if identifier is not given explicitly in the options, we
+        # need to add it to ensure that the replies find matching
+        # jobs.
+        if not "Identifier" in kw and not "identifier" in kw:
+            kw["Identifier"] = id
+        
         log = self._log
     
         log(DEBUG, "_submitCmd: id=" + repr(id) + ", cmd=" + repr(cmd) + ", **" + repr(kw))
@@ -2132,7 +2147,7 @@ class FCPNode:
         if cmd == 'ClientGet' and 'URI' in kw:
             job.uri = kw['URI']
     
-        if cmd == 'ClientPut':
+        if cmd == 'ClientPut' and 'Metadata.ContentType' in kw:
             job.mimetype = kw['Metadata.ContentType']
     
         self.clientReqQueue.put(job)
@@ -2510,11 +2525,11 @@ class FCPNode:
 
         if hdr == 'SubscribedUSKRoundFinished': 
             job.callback('successful', msg) 
-        return 
+            return
 
         if hdr == 'SubscribedUSKSendingToNetwork': 
             job.callback('successful', msg) 
-        return        
+            return
 
         # -----------------------------
         # handle testDDA messages
@@ -2902,8 +2917,8 @@ class JobTicket:
         self.followRedirect = opts.get('followRedirect', False)
     
         # find out if persistent
-        if kw.get("Persistent", "connection") != "connection" \
-        or kw.get("PersistenceType", "connection") != "connection":
+        if (kw.get("Persistent", "connection") != "connection" or
+            kw.get("PersistenceType", "connection") != "connection"):
             self.isPersistent = True
         else:
             self.isPersistent = False
@@ -2953,7 +2968,7 @@ class JobTicket:
         log(DEBUG, "wait:%s:%s: timeout=%ss" % (self.cmd, self.id, timeout))
     
         # wait forever for job to complete, if no timeout given
-        if timeout == None:
+        if timeout is None:
             log(DEBUG, "wait:%s:%s: no timeout" % (self.cmd, self.id))
             while not self.lock.acquire(False):
                 time.sleep(_pollInterval)
@@ -3033,6 +3048,7 @@ class JobTicket:
         If result is an exception object, then raises it
         """
         if isinstance(self.result, Exception):
+            self.node.shutdown()
             raise self.result
         else:
             return self.result
