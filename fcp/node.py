@@ -2514,11 +2514,11 @@ class FCPNode:
 
         if hdr == 'SubscribedUSKRoundFinished': 
             job.callback('successful', msg) 
-        return 
+            return 
 
         if hdr == 'SubscribedUSKSendingToNetwork': 
             job.callback('successful', msg) 
-        return        
+            return        
 
         # -----------------------------
         # handle testDDA messages
