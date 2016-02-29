@@ -32,7 +32,7 @@ class pyfreenet_install(distutils.command.install.install):
         if not doze:
             os.system("cp " + man_dir + "/*.1 " + man_target_dir)
 setup(name="pyFreenet",
-      version="0.3.2",
+      version="0.3.3",
       description="Freenet Client Protocol Helper",
       author="Arne Babenhauserheide",
       author_email="arne_bab@web.de",
