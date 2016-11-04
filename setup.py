@@ -1,86 +1,72 @@
 """
-distutils installation script for pyfcp
+distutils installation script for pyFreenet
 """
-import sys, os
+import sys
+import os
+import logging
+import distutils.command.install
+from distutils.core import setup
+
+
 
 doze = sys.platform.lower().startswith("win")
 
-# barf if prerequisite module 'SSLCrypto' is not installed
-try:
-    if 0:
-        sys.stdout.write("Testing if SSLCrypto module is installed...")
-        sys.stdout.flush()
-        import SSLCrypto
-        print "ok!"
-except:
-    print "failed!"
-    print
-    print "You have not installed the SSLCrypto module"
-    print "Please refer to the INSTALL file in this directory"
-    print "and follow the instructions"
-    print
-    print "You can continue with this installation, but you will"
-    print "not have the protection of encrypted config files."
-    resp = raw_input("Continue installation anyway? [Y/n] ")
-    resp = resp.strip().lower() or "y"
-    resp = resp[0]
-    if resp == 'n':
-        print "Installation aborted"
-        sys.exit(1)
-    else:
-        print "Installing without encryption"
-
-# barf if user is not running this script as root
-#if not doze:
-#    if (os.getuid() != 0):
-#        print "You must be root to do this installation"
-#        sys.exit(1)
-
+scripts = ["freesitemgr", "pyNodeConfig", 
+           "fcpget", "fcpput", "fcpupload", "fcpgenkey", "fcpinvertkey", "fcpredirect", "fcpnames", 
+           "fproxyproxy", "copyweb"  # , "freedisk"  # <- not yet reviewed
+           ]
 if doze:
-    freesitemgrScript = "freesitemgr.py"
-    pyNodeConfigScript = "pyNodeConfig.py"
-    fcpgetScript = "fcpget.py"
-    fcpputScript = "fcpput.py"
-    fcpgenkeyScript = "fcpgenkey.py"
-    fcpinvertScript = "fcpinvertkey.py"
-    fcpredirectScript = "fcpredirect.py"
-    freediskScript = "freedisk.py"
-    fcpnamesScript = "fcpnames.py"
-    fproxyproxyScript = "fproxyproxy.py"
-else:
-    freesitemgrScript = "freesitemgr"
-    pyNodeConfigScript = "pyNodeConfig"
-    fcpgetScript = "fcpget"
-    fcpputScript = "fcpput"
-    fcpgenkeyScript = "fcpgenkey"
-    fcpinvertScript = "fcpinvertkey"
-    fcpredirectScript = "fcpredirect"
-    freediskScript = "freedisk"
-    fcpnamesScript = "fcpnames"
-    fproxyproxyScript = "fproxyproxy"
-
-from distutils.core import setup
-setup(name="PyFCP",
-      version="0.1",
-      description="Freenet FCP access freesite management and XML-RPC modules",
-      author="David McNab",
-      author_email="david@freenet.org.nz",
-       url ="http://127.0.0.1:8888/USK@T4gW1EvwSrR9AOlBT2hFnWy5wK0rtd5rGhf6bp75tVo,E9uFCy0NhiTbR0jVQkY77doaWtxTrkS9kuMrzOtNzSQ,AQABAAE/pyfcp/0",
-
-      packages = ['fcp'],
-      py_modules = ["minibot"],
-      scripts = [freesitemgrScript, fcpgetScript, fcpputScript,
-                 fcpgenkeyScript, fcpinvertScript, fcpredirectScript,
-                 freediskScript, fcpnamesScript, fproxyproxyScript,
-                 pyNodeConfigScript,
-                 ],
+    for i in range(len(scripts)):
+        scripts[i] += ".py"
 
 
-#      py_modules=["fcp", "fcpxmlrpc", "fcpsitemgr"]
+class pyfreenet_install(distutils.command.install.install):
+    def run(self, *args, **kwds):
+        distutils.command.install.install.run(self, *args, **kwds)
+        man_dir = os.path.abspath("./manpages/")
+        man_target_dir = os.path.join(self.install_base, "share/man/man1")
+        try:
+            print("Creating man-page directory at", man_target_dir)
+            os.makedirs(man_target_dir)
+        except Exception as e:
+            if str(e).endswith("File exists: '" + man_target_dir + "'"):
+                print("info: Could not create man-page directory: already existed.")
+            else:
+                print(e)
+        if not doze:
+            os.system("cp " + man_dir + "/*.1 " + man_target_dir)
 
+
+setup(name="pyFreenet",
+      version="0.4.0",
+      description="Freenet Client Protocol Helper",
+      author="Arne Babenhauserheide",
+      author_email="arne_bab@web.de",
+      url="http://127.0.0.1:8888/USK@38~ZdMc3Kgjq16te1A7UvRrAZadwviLgePY~CzCq32c,Z9vOKndIpemk~hfwg5yQvZKetfrm6AXs36WKVCvIOBo,AQACAAE/pyFreenet/-1/",
+      packages = ['fcp', 'freenet'],
+      scripts = scripts,
+      cmdclass={"install": pyfreenet_install}, # thanks to lc-tools
+      classifiers = [
+        "Programming Language :: Python :: 2",
+        "Development Status :: 4 - Beta",
+        "Environment :: Other Environment",
+        "Intended Audience :: Developers",
+        "License :: OSI Approved :: GNU General Public License (GPL)",
+        "Operating System :: OS Independent",
+        "Topic :: Software Development :: Libraries :: Python Modules",
+        ],
+      long_description = open("README").read(),
     )
 
 
-if not doze:
-    os.system("cp manpages/*.1 /usr/share/man/man1")
+# TODO: Only do this when the installation is to /
+#       currently man-page install is broken with --user
+# some pointers which did not work:
+# import distutils.command.install
+# import distutils.dist
+# i = distutils.command.install.install(distutils.dist.Distribution())
+# i.finalize_options()
+# i.finalize_unix()
+# print i.convert_paths("data")
+# print i.root, i.prefix
 
