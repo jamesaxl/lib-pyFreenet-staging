@@ -11,10 +11,11 @@ from distutils.core import setup
 
 doze = sys.platform.lower().startswith("win")
 
-scripts = ["freesitemgr", "pyNodeConfig", 
-           "fcpget", "fcpput", "fcpupload", "fcpgenkey", "fcpinvertkey", "fcpredirect", "fcpnames", 
-           "fproxyproxy", "copyweb"  # , "freedisk"  # <- not yet reviewed
-           ]
+scripts3 = ["freesitemgr", "pyNodeConfig", 
+            "fcpget", "fcpput", "fcpupload", "fcpgenkey", "fcpinvertkey", "fcpredirect", "fcpnames", 
+            "fproxyproxy", "copyweb"  # , "freedisk"  # <- not yet reviewed
+            ]
+scripts = [] # py2
 if doze:
     for i in range(len(scripts)):
         scripts[i] += ".py"
@@ -38,8 +39,8 @@ class pyfreenet_install(distutils.command.install.install):
 
 
 setup(name="pyFreenet",
-      version="0.4.0",
-      description="Freenet Client Protocol Helper",
+      version="0.4.2",
+      description="Freenet Client Protocol Helper for Python2",
       author="Arne Babenhauserheide",
       author_email="arne_bab@web.de",
       url="http://127.0.0.1:8888/USK@38~ZdMc3Kgjq16te1A7UvRrAZadwviLgePY~CzCq32c,Z9vOKndIpemk~hfwg5yQvZKetfrm6AXs36WKVCvIOBo,AQACAAE/pyFreenet/-1/",
