@@ -22,7 +22,6 @@ import base64
 import mimetypes
 import os
 import pprint
-import random
 import select
 import hashlib
 import socket
@@ -31,10 +30,18 @@ import sys
 import tempfile # for doctests
 import _thread
 import threading
-import time
 import traceback
 import re
 import unicodedata
+import uuid
+import time
+from pathlib import Path, PurePosixPath, PosixPath
+import _io
+
+try:
+    import magic
+except ModuleNotFoundError:
+    raise ModuleNotFoundError('magic module is required')
 
 from . import pseudopythonparser
 
@@ -110,26 +117,31 @@ class FCPNameLookupFailure(Exception):
 
     
 # where we can find the freenet node FCP port
-defaultFCPHost = "127.0.0.1"
-defaultFCPPort = 9481
-defaultFProxyHost = "127.0.0.1"
-defaultFProxyPort = 8888
+FCP_HOST = 'localhost'
+
+FCP_PORT = 9481
+
+FPROXY_HOST = 'localhost'
+
+FPROXY_PORT = 8888
 
 # may set environment vars for FCP host/port
 if "FCP_HOST" in os.environ:
-    defaultFCPHost = os.environ["FCP_HOST"].strip()
+    FCP_HOST = os.environ["FCP_HOST"].strip()
+
 if "FCP_PORT" in os.environ:
-    defaultFCPPort = int(os.environ["FCP_PORT"].strip())
+    FCP_PORT = int(os.environ["FCP_PORT"].strip())
 
 # ditto for fproxy host/port
 if "FPROXY_HOST" in os.environ:
-    defaultFProxyHost = os.environ["FPROXY_HOST"].strip()
+    FPROXY_HOST = os.environ["FPROXY_HOST"].strip()
+
 if "FPROXY_PORT" in os.environ:
-    defaultFProxyPort = int(os.environ["FPROXY_PORT"].strip())
+    FPROXY_PORT = int(os.environ["FPROXY_PORT"].strip())
 
 # poll timeout period for manager thread
-pollTimeout = 0.1
-#pollTimeout = 3
+POLL_TIMEOUT = 0.1
+#POLL_TIMEOUT = 3
 
 # list of keywords sent from node to client, which have
 # int values
@@ -153,14 +165,15 @@ NOISY = 7
 # peer note types
 PEER_NOTE_PRIVATE_DARKNET_COMMENT = 1
 
-defaultVerbosity = ERROR
+DEFAULT_VERBOSITY = CRITICAL
 
 ONE_YEAR = 86400 * 365
 
-fcpVersion = "0.3.4"
+COMPRESSION_CODECS = [('GZIP', 0), ('BZIP2', 1), ('LZMA', 2)] # safe defaults
 
+fcpVersion = '0.3.4'
 
-class FCPNode:
+class FCPNode(object):
     """
     Represents an interface to a freenet node via its FCP port,
     and exposes primitives for the basic genkey, get, put and putdir
@@ -205,23 +218,6 @@ class FCPNode:
           
     """
     
-    svnLongRevision = "$Revision$"
-    svnRevision = svnLongRevision[ 11 : -2 ]
-    
-    noCloseSocket = True
-    nodeIsAlive = False
-    
-    nodeVersion = None;
-    nodeFCPVersion = None;
-    nodeBuild = None;
-    nodeRevision = None;
-    nodeExtBuild = None;
-    nodeExtRevision = None;
-    nodeIsTestnet = None;
-    compressionCodecs = [("GZIP", 0), ("BZIP2", 1), ("LZMA", 2)]; # safe defaults
-
-    
-
     def __init__(self, **kw):
         """
         Create a connection object
@@ -230,16 +226,16 @@ class FCPNode:
             - name - name of client to use with reqs, defaults to random. This
               is crucial if you plan on making persistent requests
             - host - hostname, defaults to environment variable FCP_HOST, and
-              if this doesn't exist, then defaultFCPHost
+              if this doesn't exist, then FCP_HOST
             - port - port number, defaults to environment variable FCP_PORT, and
-              if this doesn't exist, then defaultFCPPort
+              if this doesn't exist, then FCP_PORT
             - logfile - a pathname or writable file object, to which log messages
               should be written, defaults to stdout unless logfunc is specified
             - logfunc - a function to which log messages should be written or None
               for no such function should be used, defaults to None
             - verbosity - how detailed the log messages should be, defaults to 0
               (silence)
-            - socketTimeout - value to pass to socket object's settimeout() if
+            - socket_timeout - value to pass to socket object's settimeout() if
               available and the value is not None, defaults to None
     
         Attributes of interest:
@@ -258,70 +254,76 @@ class FCPNode:
         """
         # Be sure that we have all of our attributes during __init__
         self.running = False
-        self.nodeIsAlive = False
-        self.testedDDA = {}
-        
+        self.node_is_alive = False
+        self.no_close_socket = True
+        self.tested_DDA = {}
+
         # grab and save parms
         env = os.environ
-        self.name = kw.get('name', self._getUniqueId())
-        self.host = kw.get('host', env.get("FCP_HOST", defaultFCPHost))
-        self.port = kw.get('port', env.get("FCP_PORT", defaultFCPPort))
+        self.name = kw.get('name', self.__get_unique_id())
+        self.host = kw.get('host', env.get("FCP_HOST", FCP_HOST))
+        self.port = kw.get('port', env.get("FCP_PORT", FCP_PORT))
         self.port = int(self.port)
-        self.socketTimeout = kw.get('socketTimeout', None)
-        
+        self.socket_timeout = kw.get('socket_timeout', None)
+
         #: The id for the connection
         self.connectionidentifier = None
-    
+
         # set up the logger
         logfile = kw.get('logfile', None)
         logfunc = kw.get('logfunc', None)
-        if(None == logfile and None == logfunc):
-            logfile = sys.stdout
-        if(None != logfile and not hasattr(logfile, 'write')):
-            # might be a pathname
-            if not isinstance(logfile, str):
-                raise Exception("Bad logfile '%s', must be pathname or file object" % logfile)
-            logfile = open(logfile, "a")
-        self.logfile = logfile
+
+        if logfile == None and logfunc == None:
+            self.logfile = sys.stdout
+        else:
+            try:
+                assert type(logfile) is str or type(logfile) is _io.TextIOWrapper
+                self.logfile = open(logfile, 'a') if type(logfile) is str else logfile
+
+            except AssertionError:
+                raise Exception('Bad logfile "{0}", must be pathname or file object'.format(logfile))
+
         self.logfunc = logfunc
-        self.verbosity = kw.get('verbosity', defaultVerbosity)
+        self.verbosity = kw.get('verbosity', DEFAULT_VERBOSITY)
     
         # try to connect to node
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if(None != self.socketTimeout):
+
+        if self.socket_timeout != None:
             try:
-                self.socket.settimeout(self.socketTimeout)
-            except Exception as e:
-                # Socket timeout setting is not available until Python 2.3, so ignore exceptions
-                pass
+                assert type(self.socket_timeout) is int
+            except AssertionError:
+                raise AssertionError('socket timout must be integer')
+
+            self.socket.settimeout(self.socket_timeout)
+
         try:
             self.socket.connect((self.host, self.port))
         except Exception as e:
             raise type(e)(
-                "Failed to connect to %s:%s - %s" % (
+                'Failed to connect to {0}:{1} - {2}'.format(
                     self.host, self.port, e)).with_traceback(
                         sys.exc_info()[2])
             
         # now do the hello
-        self._hello()
-        self.nodeIsAlive = True
+        self.__hello()
+        self.node_is_alive = True
     
         # the pending job tickets
         self.jobs = {} # keyed by request ID
-        self.keepJobs = [] # job ids that should never be removed from self.jobs
+        self.keep_jobs = [] # job ids that should never be removed from self.jobs
     
         # queue for incoming client requests
-        self.clientReqQueue = queue.Queue()
+        self.client_req_queue = queue.Queue()
     
         # launch receiver thread
         self.running = True
-        self.shutdownLock = threading.Lock()
-        _thread.start_new_thread(self._mgrThread, ())
+        self.shutdown_lock = threading.Lock()
+        _thread.start_new_thread(self.__mgr_thread, ())
     
         # and set up the name service
         namesitefile = kw.get('namesitefile', None)
         self.namesiteInit(namesitefile)
-    
 
     def __del__(self):
         """
@@ -345,8 +347,7 @@ class FCPNode:
 
     # basic FCP primitives
     
-
-    def genkey(self, **kw):
+    def gen_key(self, **kw):
         """
         Generates and returns an SSK keypair
         
@@ -362,28 +363,69 @@ class FCPNode:
                       - if status is 'failed' or 'pending', this will contain
                         a dict containing the response from node
             - usk - default False - if True, returns USK uris
+            - ksk - default False - if True, returns KSK uris
             - name - the path to put at end, optional
         """
-        id = kw.pop("id", None)
-        if not id:
-            id = self._getUniqueId()
-        
-        pub, priv = self._submitCmd(id, "GenerateSSK", Identifier=id, **kw)
-    
-        name = kw.get("name", None)
-        if name:
-            pub = pub + name
-            priv = priv + name
-    
-            if kw.get("usk", False):
-                pub = pub.replace("SSK@", "USK@")+"/0"
-                priv = priv.replace("SSK@", "USK@")+"/0"
-    
-        return pub, priv
-    
 
+        async = kw.get('async', False)
+        try:
+            assert type(async) is bool
+        except AssertionError:
+            raise AssertionError('sync must be bool')
+
+        callback = kw.get('callback', None)
+        try:
+            assert callback == None or callable(kw.get('callback', None)) == True
+        except AssertionError:
+            raise AssertionError('callback must be callable')
+
+
+        _id = kw.get('_id', None)
+        try:
+            assert _id == None or type(_id) is str
+        except AssertionError:
+            raise AssertionError('_id must be str')
+
+        ksk = kw.get('ksk', False)
+        try:
+            assert type(ksk) is bool
+        except AssertionError:
+            raise AssertionError('ksk must be bool')
+
+        
+        usk = kw.get('usk', False)
+        try:
+            assert type(usk) is bool
+        except AssertionError:
+            raise AssertionError('usk must be bool')
+
+        name = kw.get('name', None)
+        try:
+            assert name == None or type(name) is str
+        except AssertionError:
+            raise AssertionError('name must be str')
+
+        if ksk and usk:
+            raise Exception('you must set one of them')
+
+        if ksk:
+            return 'KSK@{0}'.format(str(uuid.uuid4()))
+
+        _id = _id if _id else self.__get_unique_id()
+
+        pub, priv = self.submit_cmd(_id, 'GenerateSSK', Identifier=_id, **kw)
+
+        if name:
+            pub += name
+            priv += name
     
-    def fcpPluginMessage(self, **kw):
+            if usk:
+                pub = '{0}{1}'.format(pub.replace('SSK@', 'USK@'), '/0')
+                priv = '{0}{1}'.format(priv.replace('SSK@', 'USK@'), '/0')
+
+        return pub, priv
+
+    def fcp_plugin_message(self, **kw):
         """
         Sends an FCPPluginMessage and returns FCPPluginReply message contents
         
@@ -403,21 +445,42 @@ class FCPNode:
             - plugin_params - a dict() containing the key-value pairs to be sent
               to the plugin as parameters
         """
-        
-        id = kw.pop("id", None)
-        if not id:
-            id = self._getUniqueId()
-            
-        params = dict(PluginName = kw.get('plugin_name'),
+
+        async = kw.get('async', False)
+        try:
+            assert type(async) is bool
+        except AssertionError:
+            raise AssertionError('async must be bool')
+
+        callback = kw.get('callback', None)
+        try:
+            assert callback == None or callable(callback) == True
+        except AssertionError:
+            raise AssertionError('callback must be callable')
+
+        _id = kw.get('_id', None)
+        try:
+            assert _id== None or type(_id) is str
+        except AssertionError:
+            raise AssertionError('_id must be string')
+
+        plugin_name = kw.get('plugin_name', None)
+        try:
+            assert type(plugin_name) is str
+        except AssertionError:
+            raise AssertionError('plugin_name must be string')
+
+        _id = _id if _id else self.__get_unique_id()
+
+        params = dict(PluginName = plugin_name,
                       Identifier = id,
-                      async      = kw.get('async',False),
-                      callback   = kw.get('callback',None))
-        
+                      async      = async,
+                      callback   = callback)
+
         for key, val in kw.get('plugin_params',{}).items():
             params.update({'Param.%s' % str(key) : val})
-        
-        return self._submitCmd(id, "FCPPluginMessage", **params)
-    
+
+        return self.submit_cmd(_id, 'FCPPluginMessage', **params)
 
     def get(self, uri, **kw):
         """
@@ -428,28 +491,36 @@ class FCPNode:
         Keywords:
             - async - whether to return immediately with a job ticket object, default
               False (wait for completion)
+
             - persistence - default 'connection' - the kind of persistence for
               this request. If 'reboot' or 'forever', this job will be able to
               be recalled in subsequent FCP sessions. Other valid values are
               'reboot' and 'forever', as per FCP spec
-            - Global - default false - if evaluates to true, puts this request
-              on the global queue. Note the capital G in Global. If you set this,
-              persistence must be 'reboot' or 'forever'
+            
+            - global_queue - default false - if evaluates to true, puts this request
+              on the global queue. If you set this, persistence must be 'reboot' or 'forever'
+            
             - Verbosity - default 0 - sets the Verbosity mask passed in the
               FCP message - case-sensitive
+            
             - priority - the PriorityClass for retrieval, default 2, may be between
               0 (highest) to 6 (lowest)
     
             - dsonly - whether to only check local datastore
+            
             - ignoreds - don't check local datastore
     
             - file - if given, this is a pathname to which to store the retrieved key
-            - followRedirect - follow a redirect if true, otherwise fail the get
+            
+            - follow_redirect - follow a redirect if true, otherwise fail the get
+            
             - nodata - if true, no data will be returned. This can be a useful
               test of whether a key is retrievable, without having to consume
               resources by retrieving it
+            
             - stream - if given, this is a writeable file object, to which the
               received data should be written a chunk at a time
+            
             - timeout - timeout for completion, in seconds, default one year
     
         Returns a 3-tuple, depending on keyword args:
@@ -460,105 +531,193 @@ class FCPNode:
               because all the data will have been written to the stream
         If key is not found, raises an exception
         """
-        self._log(INFO, "get: uri=%s" % uri)
-    
-        self._log(DETAIL, "get: kw=%s" % kw)
-    
+        
+        try:
+            assert uri.startswith('SSK@') or uri.startswith('USK@') or uri.startswith('KSK@')
+        except AssertionError:
+            raise AssertionError('key must be started with SSK@, USK@ or KSK@')
+
+        try:
+            assert len(uri.split('@')) == 2
+        except AssertionError:
+             raise AssertionError('key must be good formed')
+
+        async = kw.get('async', False)
+        try:
+            assert type(async) is bool
+        except AssertionError:
+            raise AssertionError('async must be False or True')
+
+        persistence = kw.get('persistence', 'connection')
+        try:
+            assert persistence in ['connection', 'reboot', 'forever'] 
+        except AssertionError:
+            raise AssertionError('persistence must be connection, reboot or forever')
+
+        global_queue = kw.get('global_queue', False)
+        try:
+            assert type(global_queue) is bool
+        except AssertionError:
+            raise AssertionError('global_queue must be bool')
+
+        callback = kw.get('callback', None)
+        try:
+            assert callback == None or callable(callback) == True
+        except AssertionError:
+            raise AssertionError('callback must be callable')
+
+        _id = kw.get('_id', None)
+        try:
+            assert _id == None or type(_id) is str
+        except AssertionError:
+            raise AssertionError('id must be string')
+
+        verbosity = kw.get('verbosity', 0)
+        try:
+            assert type(verbosity) is int
+        except AssertionError:
+            raise AssertionError('verbosity must be 0 or 1')
+
+        priority = kw.get('priority', 2)
+        try:
+            assert priority in range(0, 7)
+        except AssertionError:
+            raise AssertionError('priority must be between 0 and 6')
+
+        dsonly = kw.get('dsonly', False)
+        try:
+            assert type(dsonly) is bool
+        except AssertionError:
+            raise AssertionError('dsonly must be bool')
+
+        ignoreds = kw.get('ignoreds', False)
+        try:
+            assert type(ignoreds) is bool
+        except AssertionError:
+            raise AssertionError('ignoreds must be bool')
+
+        file = kw.get('file', None)
+        
+        try:
+            assert file == None or type(file) is str
+        except AssertionError:
+            raise AssertionError('file must be string path')
+        
+        if file:
+            if not PosixPath(file).exists():
+                raise FileNotFoundError('file not found {0}'.format(file))
+
+        follow_redirect = kw.get('follow_redirect', False)
+        try:
+            assert type(follow_redirect) is bool
+        except AssertionError:
+            raise AssertionError('follow_redirect must be bool')
+
+        nodata = kw.get('nodata', False)
+        try:
+            assert type(nodata) is bool
+        except AssertionError:
+            raise AssertionError('nodata must be bool')
+
+        stream = kw.get('stream', None)
+        try:
+            assert type(stream) is _io.TextIOWrapper or stream == None
+        except AssertionError:
+            raise AssertionError('stream must be bool')
+
+        wait_until_sent = kw.get('wait_until_sent', False)
+        try:
+            assert type(wait_until_sent) is bool
+        except AssertionError:
+            raise AssertionError('wait_until_sent must be bool')
+
+        realtime = kw.get('realtime', False)
+        try:
+            assert type(realtime) is bool
+        except AssertionError:
+            raise AssertionError('realtime must be bool')
+
+        maxretries = kw.get("maxretries", -1)
+        try:
+            assert type(maxretries) is int
+        except AssertionError:
+            raise AssertionError('maxretries must be int')
+
+        maxsize = kw.get("maxsize", 1000000000000)
+        try:
+            assert maxsize > 0
+        except AssertionError:
+            raise AssertionError('maxsize must be integer and > than zero')
+
+        timeout = kw.get('timeout', ONE_YEAR)
+        try:
+            assert timeout > 0
+        except AssertionError:
+            raise AssertionError('timeout must be integer and > than zero')
+
+        self._log(INFO, 'get: uri={0}'.format(uri))
+
+        self._log(DETAIL, 'get: kw={0}'.format(kw))
+
         # ---------------------------------
         # format the request
         opts = {}
-    
-        id = kw.pop("id", None)
-        if not id:
-            id = self._getUniqueId()
-    
-        opts['async'] = kw.pop('async', False)
-        opts['followRedirect'] = kw.pop('followRedirect', True)
-        opts['waituntilsent'] = kw.get('waituntilsent', False)
+
+        _id = kw.get('id', None) if kw.pop('id',None) else self.__get_unique_id()
+
+        opts['async'] = async
+        opts['follow_redirect'] = follow_redirect
+        opts['wait_until_sent'] = wait_until_sent
+
         if 'callback' in kw:
-            opts['callback'] = kw['callback']
-        opts['Persistence'] = kw.pop('persistence', 'connection')
-        if kw.get('Global', False):
-            print("global get")
-            opts['Global'] = "true"
-        else:
-            opts['Global'] = "false"
-    
-        opts['Verbosity'] = kw.get('Verbosity', 0)
-    
-        if opts['Global'] == 'true' and opts['Persistence'] == 'connection':
+            opts['callback'] = callback
+
+        opts['Persistence'] = persistence
+
+        opts['Global'] = global_queue
+
+        opts['Verbosity'] = verbosity
+
+        if global_queue and persistence == 'connection':
             raise Exception("Global requests must be persistent")
-    
-        file = kw.pop("file", None)
+
         if file:
-            # make sure we have an absolute path
-            file = os.path.abspath(file)
             opts['ReturnType'] = "disk"
-            #opts['File'] = file
             opts['Filename'] = file
             # need to do a TestDDARequest to have a chance of a
             # successful get to file.
-            self.testDDA(Directory=os.path.dirname(file),
+            self.testDDA(Directory=str(PurePosixPath(file).parent),
                          WantWriteDirectory=True)
-    
-        elif kw.get('nodata', False):
-            nodata = True
+
+        elif nodata:
             opts['ReturnType'] = "none"
-        elif 'stream' in kw:
+        elif stream:
             opts['ReturnType'] = "direct"
-            opts['stream'] = kw['stream']
+            opts['stream'] = stream
         else:
-            nodata = False
             opts['ReturnType'] = "direct"
-        
-        opts['Identifier'] = id
-        
-        if kw.get("ignoreds", False):
-            opts["IgnoreDS"] = "true"
-        else:
-            opts["IgnoreDS"] = "false"
-        
-        if kw.get("dsonly", False):
-            opts["DSOnly"] = "true"
-        else:
-            opts["DSOnly"] = "false"
-        
-    #    if uri.startswith("freenet:CHK@") or uri.startswith("CHK@"):
-    #        uri = os.path.splitext(uri)[0]
-    
-        # process uri, including possible namesite lookups
-        uri = uri.split("freenet:")[-1]
-        if len(uri) < 5 or (uri[:4] not in ('SSK@', 'KSK@', 'CHK@', 'USK@', 'SVK@')):
-            # we seem to have a 'domain name' uri
-            try:
-                domain, rest = uri.split("/", 1)
-            except:
-                domain = uri
-                rest = ''
-            
-            tgtUri = self.namesiteLookup(domain)
-            if not tgtUri:
-                raise FCPNameLookupFailure(
-                        "Failed to resolve freenet domain '%s'" % domain)
-            if rest:
-                uri = (tgtUri + "/" + rest).replace("//", "/")
-            else:
-                uri = tgtUri
-            
+
+        opts['Identifier'] = _id
+
+        opts["IgnoreDS"] = ignoreds
+
+        opts["DSOnly"] = dsonly
+
+        opts['realtime'] = realtime
+
+        opts['MaxRetries'] = maxretries
+
+        opts['MaxSize'] = maxsize
+
+        opts['PriorityClass'] = priority
+
+        opts['timeout'] = timeout
+
         opts['URI'] = uri
-    
-        opts['MaxRetries'] = kw.get("maxretries", -1)
-        opts['MaxSize'] = kw.get("maxsize", "1000000000000")
-        opts['PriorityClass'] = int(kw.get("priority", 2))
-    
-        opts['timeout'] = int(kw.pop("timeout", ONE_YEAR))
-    
-        #print "get: opts=%s" % opts
-    
+
         # ---------------------------------
         # now enqueue the request
-        return self._submitCmd(id, "ClientGet", **opts)
-    
+        return self.submit_cmd(_id, "ClientGet", **opts)
 
     def put(self, uri="CHK@", **kw):
         """
@@ -569,21 +728,18 @@ class FCPNode:
         
         Keywords - you must specify one of the following to choose an insert mode:
             - file - path of file from which to read the key data
+
             - data - the raw data of the key as string
-            - dir - the directory to insert, for freesite insertion
+
             - redirect - the target URI to redirect to
 
         Keywords for 'file' mode:
-            - name - human-readable target filename - default is taken from URI
-
-        Keywords for 'dir' mode:
-            - name - name of the freesite, the 'sitename' in SSK@privkey/sitename'
-            - usk - whether to insert as a USK (USK@privkey/sitename/version/), default False
-            - version - valid if usk is true, default 0
+            - target_file_name - human-readable target filename - default is taken from URI 
     
         Keywords for 'file' and 'data' modes:
-            - chkonly - only generate CHK, don't insert - default false
-            - nocompress - do not compress on insert - default false
+            - chk_only - only generate CHK, don't insert - default false
+
+            - dont_compress - do not compress on insert - default false
     
         Keywords for 'file', 'data' and 'redirect' modes:
             - mimetype - the mime type, default application/octet-stream
@@ -591,545 +747,546 @@ class FCPNode:
         Keywords valid for all modes:
             - async - whether to do the job asynchronously, returning a job ticket
               object (default False)
-            - waituntilsent - default False, if True, and if async=True, waits
+
+            - wait_until_sent - default False, if True, and if async=True, waits
               until the command has been sent to the node before returning a 
               job object
+
             - persistence - default 'connection' - the kind of persistence for
               this request. If 'reboot' or 'forever', this job will be able to
               be recalled in subsequent FCP sessions. Other valid values are
               'reboot' and 'forever', as per FCP spec
-            - Global - default false - if evaluates to true, puts this request
+
+            - global_queue - default false - if evaluates to true, puts this request
               on the global queue. Note the capital G in Global. If you set this,
               persistence must be 'reboot' or 'forever'
+
             - Verbosity - default 0 - sets the Verbosity mask passed in the
               FCP message - case-sensitive
-            - LocalRequestOnly - default False - whether to insert the data
+
+            - local_request_only - default False - whether to insert the data
               into only the local datastore, instead of sending it into the
               network. This does not allow others to fetch the data and is
               only useful for testing purposes.
-    
+
             - maxretries - maximum number of retries, default 3
+
             - priority - the PriorityClass for retrieval, default 3, may be between
               0 (highest) to 6 (lowest)
+
             - realtime true/false - sets the RealTimeRequest flag.
     
             - timeout - timeout for completion, in seconds, default one year
+
+            - ignore_usk_date_hints 
     
         Notes:
-            - exactly one of 'file', 'data' or 'dir' keyword arguments must be present
+            - exactly one of 'file', 'data' keyword arguments must be present
         """
-        # divert to putdir if dir keyword present
-        if 'dir' in kw:
-            self._log(DETAIL, "put => putdir")
-            return self.putdir(uri, **kw)
-    
+
+        try:
+            assert uri.startswith('SSK@') or uri.startswith('USK@') or uri.startswith('KSK@') or uri.startswith('CHK@')
+        except AssertionError:
+            raise AssertionError('key must be started with SSK@, USK@, CHK@ or KSK@')
+
+        try:
+            assert len(uri.split('@')) == 2
+        except AssertionError:
+             raise AssertionError('key must be good formed')
+
+        async =  kw.get('async', False)
+        try:
+            assert async in [False, True]
+        except AssertionError:
+            raise AssertionError('async must be False or True')
+ 
+        keep  = kw.get('keep', False)
+        try:
+            assert keep in [False, True]
+        except AssertionError:
+            raise AssertionError('keep must be False or True')
+
+        wait_until_sent =  kw.get('wait_until_sent', False)
+        try:
+            assert wait_until_sent in [False, True]
+        except AssertionError:
+            raise AssertionError('wait_until_sent must be False or True')
+     
+        persistence = kw.get('persistence', 'connection')
+        try:
+            assert persistence in ['connection', 'reboot', 'forever'] 
+        except AssertionError:
+            raise AssertionError('persistence must be connection, reboot or forever')
+
+        global_queue = kw.get('global_queue', False)
+        try:
+            assert global_queue in [False, True] 
+        except AssertionError:
+            raise AssertionError('global_queue must be False or True')
+
+        callback = kw.get('callback', None)
+        try:
+            assert callback == None or callable(kw.get('callback', None))
+        except AssertionError:
+            raise AssertionError('callback must be callable')
+
+        _id = kw.get('_id', None)
+        try:
+            assert _id == None or type(_id) is str
+        except AssertionError:
+            raise AssertionError('id must be string')
+
+        verbosity = kw.get('verbosity', 0)
+        try:
+            assert verbosity in [0, 1]
+        except AssertionError:
+            raise AssertionError('verbosity must be 0 or 1')
+
+        maxretries = kw.get('maxretries', -1)
+        try:
+            assert maxretries in range(-1, 1000000)
+        except AssertionError:
+            raise AssertionError('maxretries must be integer between -1 and 999999')
+
+        priority = kw.get('priority', 2)
+        try:
+            assert priority in range(0, 7)
+        except AssertionError:
+            raise AssertionError('priority must be between 0 and 6')
+
+        file = kw.get('file', None)
+        try:
+            assert file == None or type(file) is str
+        except AssertionError:
+            raise AssertionError('file must be None or string path')
+
+        data = kw.get('data', None)
+        try:
+            assert data == None or type(data) is str or type(data) is bytes
+        except AssertionError:
+            raise AssertionError('data must be None or string')
+
+        redirect = kw.get('redirect', False)
+        try:
+            assert type(redirect) is bool
+        except AssertionError:
+            raise AssertionError('redirect must be bool')
+
+        mime_type = kw.get('mime_type', None)
+        try:
+            assert mime_type == None or type(mime_type) is str
+        except AssertionError:
+            raise AssertionError('mime_type must be None or string')
+
+        target_file_name = kw.get('target_file_name', None)
+        try:
+            assert target_file_name == None or type(target_file_name) is str
+        except AssertionError:
+            raise AssertionError('target_file_name must be None or string')
+
+        target_uri = kw.get('target_uri', None)
+        try:
+            assert target_uri == None or type(target_uri) is str
+        except AssertionError:
+            raise AssertionError('target_uri must be None or string')
+
+        local_request_only = kw.get('local_request_only', False)
+        try:
+            assert local_request_only in [False, True]
+        except AssertionError:
+            raise AssertionError('local_request_only must be False or True')
+
+        realtime = kw.get('realtime', False)
+        try:
+            assert realtime in [False, True]
+        except AssertionError:
+            raise AssertionError('realtime must be False or True')
+  
+        extra_inserts_single_block = kw.get('extra_inserts_single_block', 0)
+        try:
+            assert extra_inserts_single_block in range(0, 3)
+        except AssertionError:
+            raise AssertionError('extra_inserts_single_block must be >= 0')
+
+        dont_compress = kw.get('dont_compress', False)
+        try:
+            assert dont_compress in [False, True]
+        except AssertionError:
+            raise AssertionError('dont_compress must be False or True')
+
+        chk_only = kw.get('chk_only', False)
+        try:
+            assert chk_only in [False, True]
+        except AssertionError:
+            raise AssertionError('chk_only must be False or True')
+
+        timeout = kw.get('timeout', ONE_YEAR)
+        try:
+            assert timeout > 0
+        except AssertionError:
+            raise AssertionError('timeout must be integer and > than zero')
+
+        local_Request_only = kw.get('local_Request_only', False)
+        try:
+            assert local_Request_only in [False, True]
+        except AssertionError:
+            raise AssertionError('local_Request_only must be False or True')
+
+        ignore_usk_date_hints = kw.get('ignore_usk_date_hints', False)
+        try:
+            assert ignore_usk_date_hints in [False, True]
+        except AssertionError:
+            raise AssertionError('ignore_usk_date_hints must be False or True')
+
+
         # ---------------------------------
         # format the request
         opts = {}
     
-        opts['async'] = kw.get('async', False)
-        opts['waituntilsent'] = kw.get('waituntilsent', False)
-        opts['keep'] = kw.get('keep', False)
-        if 'callback' in kw:
-            opts['callback'] = kw['callback']
-    
-        self._log(DETAIL, "put: uri=%s async=%s waituntilsent=%s" % (
-                            uri, opts['async'], opts['waituntilsent']))
+        opts['async'] = async
+        opts['wait_until_sent'] = wait_until_sent
+        opts['keep'] = keep
 
-        opts['Persistence'] = kw.pop('persistence', 'connection')
-        if kw.get('Global', False):
-            opts['Global'] = "true"
-        else:
-            opts['Global'] = "false"
+        if callback: opts['callback'] = callback
+    
+        self._log(DETAIL, 'put: uri={0} async={1} wait_until_sent={2}'.format(
+                            uri, opts['async'], opts['wait_until_sent']))
+
+        opts['Persistence'] = persistence
         
-        if opts['Global'] == 'true' and opts['Persistence'] == 'connection':
+        opts['Global'] = global_queue
+
+        if global_queue and persistence == 'connection':
             raise Exception("Global requests must be persistent")
     
-
-        if kw.get('Global', False):
+        if global_queue:
             # listen to the global queue
-            self.listenGlobal()
-
-        # process uri, including possible namesite lookups
-        uri = uri.split("freenet:")[-1]
-        if len(uri) < 4 or (uri[:4] not in ('SSK@', 'KSK@', 'CHK@', 'USK@', 'SVK@')):
-            # we seem to have a 'domain name' uri
-            try:
-                domain, rest = uri.split("/", 1)
-            except:
-                domain = uri
-                rest = ''
-            
-            tgtUri = self.namesiteLookup(domain)
-            if not tgtUri:
-                raise FCPNameLookupFailure(
-                    "Failed to resolve freenet domain '%s'" % domain)
-            if rest:
-                uri = (tgtUri + "/" + rest).replace("//", "/")
-            else:
-                uri = tgtUri
+            self.listen_global()
     
         opts['URI'] = uri
-        
-        # determine a mimetype
-        mimetype = kw.get("mimetype", None)
-        if mimetype is None:
-            # not explicitly given - figure one out (based on filename)
-            ext = os.path.splitext(uri)[1]
-            if ext:
-                # only use basename, if it has an extension
-                filename = os.path.basename(uri)
+
+        _id = _id if _id else self.__get_unique_id()
+        opts['Identifier'] = _id
+
+        if (data and file and redirect) \
+            or (data and file) \
+            or (data and redirect) \
+            or (file and redirect):
+            raise Exception('you must specify one of them: file, data or redirect')
+
+        if data:
+            if mime_type:
+                opts['Metadata.ContentType'] = mime_type
             else:
-                # no CHK@ file extension, try for filename (only in "file" mode)
-                if kw.get('file', None) is not None:
-                    filename = os.path.basename(kw['file'])
-                else:
-                    # last resort fallback: use the full uri.
-                    filename = uri
-    
-            # got some kind of 'filename with extension', convert to mimetype
-            mimetype = guessMimetype(filename)
-    
-        # now can specify the mimetype
-        opts['Metadata.ContentType'] = mimetype
-    
-        id = kw.pop("id", None)
-        if not id:
-            id = self._getUniqueId()
-        opts['Identifier'] = id
-    
-        chkOnly = toBool(kw.get("chkonly", "false"))
-    
-        opts['Verbosity'] = kw.get('Verbosity', 0)
-        opts['MaxRetries'] = kw.get("maxretries", -1)
-        opts['PriorityClass'] = kw.get("priority", 3)
-        opts['RealTimeFlag'] = toBool(kw.get("realtime", "false"))
-        opts['GetCHKOnly'] = chkOnly
-        opts['DontCompress'] = toBool(kw.get("nocompress", "false"))
-        opts['Codecs'] = kw.get('Codecs', 
-                                self.defaultCompressionCodecsString())
-        opts['LocalRequestOnly'] = kw.get('LocalRequestOnly', False)
-        
-        if "file" in kw:
-            filepath = os.path.abspath(kw['file'])
-            opts['UploadFrom'] = "disk"
-            opts['Filename'] = filepath
-            if "mimetype" not in kw:
-                opts['Metadata.ContentType'] = guessMimetype(kw['file'])
-            # Add a base64 encoded sha256 hash of the file to sidestep DDA
+                opts['Metadata.ContentType'] = 'application/octet-stream'
+
+            opts['UploadFrom'] = 'direct'
+            opts['Data'] = data
+            if target_file_name:
+                opts['TargetFilename'] = target_file_name
+
+        elif file:
+            opts['Metadata.ContentType'] = magic.from_file(file, mime=True).decode()
+            opts['UploadFrom'] = 'disk'
+            opts['Filename'] = file
             opts['FileHash'] = base64.b64encode(
-                sha256dda(self.connectionidentifier, id, 
-                          path=filepath)).decode('utf-8')
-    
-        elif "data" in kw:
-            opts["UploadFrom"] = "direct"
-            opts["Data"] = kw['data']
-            targetFilename = kw.get('name')
-            if targetFilename:
-                opts["TargetFilename"] = targetFilename
-    
-        elif "redirect" in kw:
-            opts["UploadFrom"] = "redirect"
-            opts["TargetURI"] = kw['redirect']
-        elif chkOnly != "true":
-            raise Exception("Must specify file, data or redirect keywords")
-        
-        if "TargetFilename" in kw: # for CHKs
-            opts["TargetFilename"] = kw["TargetFilename"]
-            
-    
-        opts['timeout'] = int(kw.get("timeout", ONE_YEAR))
+            sha256dda(self.connectionidentifier, _id, 
+                      path=file)).decode('utf-8')
 
-        # if the mime-type is application/octet-stream, kill it to
-        # avoid forcing metadata creation
-        mime = opts.get('Metadata.ContentType', None)
-        if mime is not None:
-            if mime == "application/octet-stream":
-                del opts['Metadata.ContentType']
+            self.testDDA(Directory=str(PurePosixPath(file).parent),
+                         WantReadDirectory=True)
 
-        if "IgnoreUSKDatehints" in kw:
-            opts["IgnoreUSKDatehints"] = kw["IgnoreUSKDatehints"]
-        
-        
-        #print "sendEnd=%s" % sendEnd
-    
-        # ---------------------------------
-        # now dispatch the job
-        return self._submitCmd(id, "ClientPut", **opts)
-    
+        elif redirect:
+            opts['UploadFrom'] = 'redirect'
+            # We should check target_uri
+            opts['TargetURI'] = target_uri
 
-    def putdir(self, uri, **kw):
-        """
-        Inserts a freesite
-    
-        Arguments:
-            - uri - uri under which to insert the key
+        elif not chk_only:
+            raise Exception('Must specify file, data or redirect keywords')
+
+        opts['Verbosity'] = verbosity
+        opts['MaxRetries'] = maxretries
+        opts['PriorityClass'] = priority
+        opts['RealTimeFlag'] = realtime
+        opts['GetCHKOnly'] = chk_only
+        opts['DontCompress'] = dont_compress
+        opts['ExtraInsertsSingleBlock'] = extra_inserts_single_block
+
+        if not dont_compress:
+            opts['Codecs'] = kw.get('codecs', 
+                                self.default_compression_codecs_string())
+
+        opts['LocalRequestOnly'] = local_Request_only
+
+        if target_file_name: # for CHKs
+            opts['TargetFilename'] = target_file_name
+
+        opts['timeout'] = timeout
+
+        opts["IgnoreUSKDatehints"] = ignore_usk_date_hints
+
+        return self.submit_cmd(_id, 'ClientPut', **opts)
+
+    def put_directory(self, uri, **kw):
+
+        '''
+        uri - private key
         
-        Keywords:
-            - dir - the directory to insert - mandatory, no default.
-              This directory must contain a toplevel index.html file
-            - name - the name of the freesite, defaults to 'freesite'
-            - usk - set to True to insert as USK (Default false)
-            - version - the USK version number, default 0
-            
-            - filebyfile - default False - if True, manually inserts
-              each constituent file, then performs the ClientPutComplexDir
-              as a manifest full of redirects. You *must* use this mode
-              if inserting from across a LAN
-    
-            - maxretries - maximum number of retries, default 3
-            - priority - the PriorityClass for retrieval, default 2, may be between
-              0 (highest) to 6 (lowest)
-    
-            - id - the job identifier, for persistent requests
-            - async - default False - if True, return immediately with a job ticket
-            - persistence - default 'connection' - the kind of persistence for
-              this request. If 'reboot' or 'forever', this job will be able to
-              be recalled in subsequent FCP sessions. Other valid values are
-              'reboot' and 'forever', as per FCP spec
-            - Global - default false - if evaluates to true, puts this request
-              on the global queue. Note the capital G in Global. If you set this,
-              persistence must be 'reboot' or 'forever'
-            - Verbosity - default 0 - sets the Verbosity mask passed in the
-              FCP message - case-sensitive
-            - allatonce - default False - if set, and if filebyfile is set, then
-              all files of the site will be inserted simultaneously, which can give
-              a nice speed-up for small to moderate sites, but cruel choking on
-              large sites; use with care
-            - globalqueue - perform the inserts on the global queue, which will
-              survive node reboots
-    
-            - timeout - timeout for completion, in seconds, default one year
-    
-    
-        Returns:
-            - the URI under which the freesite can be retrieved
-        """
+        directory - directory to upload without subdir
+        
+        site_name = 
+        
+        usk =
+        
+        version =
+        
+        maxretries =
+        
+        _id =
+        
+        async =
+        
+        persistence
+        
+        global_queue
+        
+        verbosity
+        
+        timeout
+
+        priority
+        
+        chk_only 
+        
+        dont_compress 
+        
+        codecs
+
+        target_filename
+
+        default_index
+
+        realtime
+        '''
+
         log = self._log
-        log(INFO, "putdir: uri=%s dir=%s" % (uri, kw['dir']))
-        # process keyword args
-        
-        chkonly = False
-        #chkonly = True
-        
-        # get keyword args
-        dir = kw['dir']
-        sitename = kw.get('name', 'freesite')
+        try:
+            assert uri.startswith('SSK@') or uri.startswith('USK@') or uri.startswith('KSK@') or uri.startswith('CHK@')
+        except AssertionError:
+            raise AssertionError('key must be started with SSK@, USK@ or KSK@')
+
+        directory = kw.get('directory', None)
+
+        try:
+            assert type(directory) is str
+        except AssertionError:
+            raise AssertionError('directory must be str')
+
+        site_name = kw.get('site_name', None)
+        try:
+            assert type(site_name) is str
+        except AssertionError:
+            raise AssertionError('site_name must be str')
+
         usk = kw.get('usk', False)
+        try:
+            assert type(usk) is bool
+        except AssertionError:
+            raise AssertionError('usk must be bool')
+
         version = kw.get('version', 0)
-        maxretries = kw.get('maxretries', 3)
-        priority = kw.get('priority', 4)
-        Verbosity = kw.get('Verbosity', 0)
+        try:
+            assert type(version) is int
+        except AssertionError:
+            raise AssertionError('version must be int')
+
+        _id =  kw.get('_id', None)
+        assert type(_id) is str or _id == None
+
+        async = kw.get('async', False)
+        assert type(async) is bool
         
-        filebyfile = kw.get('filebyfile', False)
+        wait_until_sent = kw.get('wait_until_sent', False)
+        assert type(wait_until_sent) is bool
+
+        persistence = kw.get('persistence', 'connection')
+        assert persistence in ['connection', 'reboot', 'forever']
+
+        global_queue = kw.get('global_queue', False)
+        assert type(global_queue) is bool
+
+        verbosity = kw.get('verbosity', 0)
+        assert verbosity == 0 or verbosity == 1
+
+        timeout = kw.get('timeout', ONE_YEAR)
+        assert timeout > 0
+
+        priority = kw.get('priority', 2)
+        assert priority in range(0,7)
+
+        chk_only = kw.get('chk_only', False)
+        assert type(chk_only) is bool
+
+        dont_compress = kw.get('dont_compress', True)
+        assert type(dont_compress) is bool
+
+        target_filename = kw.get('target_filename', False)
+        assert type(target_filename) is bool
         
-        #if filebyfile:
-        #    raise Hell
+        realtime = kw.get('realtime', False)
+        assert type(realtime) is bool
         
-        if 'allatonce' in kw:
-            allAtOnce = kw['allatonce']
-            filebyfile = True
+        maxretries = kw.get('maxretries', -1)
+        assert type(maxretries) is int
+        
+        default_index = kw.get('default_index', 'index.html')
+        assert type(default_index) is str
+        
+        callback = kw.get('callback', False)
+        assert type(callback) is bool or callable(callback)
+
+        full_uri = '{0}{1}/'.format(uri, site_name)
+
+        upload_from = kw.get('upload_from', 'disk')
+        assert type(upload_from) is str and upload_from in ['direct', 'disk', 'redirect']
+
+        if usk:
+            full_uri = uri.replace('SSK@', 'USK@')
+            full_uri = full_uri.split('/')[0]
+            full_uri = '{0}/{1}/{2}'.format(full_uri, site_name, version)
+
+        if not _id:
+            _id = self.__get_unique_id()
+
+        if global_queue:
+            persistence = 'forever'
+            self.listen_global()
         else:
-            allAtOnce = False
-        
-        if 'maxconcurrent' in kw:
-            maxConcurrent = kw['maxconcurrent']
-            filebyfile = True
-            allAtOnce = True
-        else:
-            maxConcurrent = 10
-        
-        if kw.get('globalqueue', False) or kw.get('Global', False):
-            globalMode = True
-            globalWord = "true"
-            persistence = "forever"
+            persistence = 'connection'
 
-        else:
-            globalMode = False
-            globalWord = "false"
-            persistence = "connection"
+        codecs = kw.get('codecs', 
+                self.default_compression_codecs_string())
 
-        if kw.get('globalqueue', False) or kw.get('Global', False):
-            # listen to the global queue
-            self.listenGlobal()
-
-        id = kw.pop("id", None)
-        if not id:
-            id = self._getUniqueId()
-
-        codecs = kw.get('Codecs', 
-                        self.defaultCompressionCodecsString())
-        
-        # derive final URI for insert
-        uriFull = uri + sitename + "/"
-        if kw.get('usk', False):
-            uriFull += "%d/" % int(version)
-            uriFull = uriFull.replace("SSK@", "USK@")
-            while uriFull.endswith("/"):
-                uriFull = uriFull[:-1]
-        
-        manifestDict = kw.get('manifest', None)
-        
-
-        # procure a manifest dict, whether supplied by caller or derived
-        if manifestDict:
-            # work from the manifest provided by caller
-            #print "got manifest kwd"
-            #print manifestDict
-            manifest = []
-            for relpath, attrDict in list(manifestDict.items()):
-                if attrDict['changed'] or (relpath == "index.html"):
-                    attrDict['relpath'] = relpath
-                    attrDict['fullpath'] = os.path.join(dir, relpath)
-                    manifest.append(attrDict)
-        else:
-            # build manifest by reading the directory
-            #print "no manifest kwd"
-            manifest = readdir(kw['dir'])
-            manifestDict = {}
-            for rec in manifest:
-                manifestDict[rec['relpath']] = rec
-            #print manifestDict
-        
-
-        # FIXME: This somehow works, but it is borked and
-        # repeated. Clean it up. I bet I am the one responsible...
-        if 0:
-            # derive CHKs for all items
-            log(INFO, "putdir: determining chks for all files")
-            
-            for filerec in manifest:
-                
-                # get the record and its fields
-                relpath = filerec['relpath']
-                fullpath = filerec['fullpath']
-                mimetype = filerec['mimetype']
-            
-                # get raw file contents
-                raw = open(fullpath, "rb").read()
-            
-                # determine CHK
-                uri = self.put("CHK@",
-                               data=raw,
-                               mimetype=mimetype,
-                               Verbosity=Verbosity,
-                               chkonly=True,
-                               priority=priority,
-                               )
-            
-                if uri != filerec.get('uri', None):
-                    filerec['changed'] = True
-                    filerec['uri'] = uri
-            
-                log(INFO, "%s -> %s" % (relpath, uri))
-            
-
-            if filebyfile:
-                # now can build up a command buffer to insert the manifest
-                # since we know all the file chks
-                msgLines = ["ClientPutComplexDir",
-                            "Identifier=%s" % id,
-                            "Verbosity=%s" % Verbosity,
-                            "MaxRetries=%s" % maxretries,
-                            "PriorityClass=%s" % priority,
-                            "URI=%s" % uriFull,
-                            "Codecs=%s" % codecs,
-                            "Persistence=%s" % persistence,
-                            "Global=%s" % globalWord,
-                            "DefaultName=index.html",
-                            ]
-                
-                # add each file's entry to the command buffer
-                n = 0
-                default = None
-                for filerec in manifest:
-                    relpath = filerec['relpath']
-                    mimetype = filerec['mimetype']
-                
-                    log(DETAIL, "n=%s relpath=%s" % (repr(n), repr(relpath)))
-                
-                    msgLines.extend(["Files.%d.Name=%s" % (n, relpath),
-                                     "Files.%d.UploadFrom=redirect" % n,
-                                     "Files.%d.TargetURI=%s" % (n, filerec['uri']),
-                                    ])
-                    n += 1
-                
-                # finish the command buffer
-                msgLines.append("EndMessage")
-                manifestInsertCmdBuf = "\n".join(msgLines) + "\n"
-                
-                # gotta log the command buffer here, since it's not sent via .put()
-                for line in msgLines:
-                    log(DETAIL, line)
-            
-                #raise Exception("debugging")
-            
-
-        # for file-by-file mode, queue up the inserts and await completion
+        files = list(Path(directory).glob('*'))
         jobs = []
-        #allAtOnce = False
-        
-        if filebyfile:
-            
-            log(INFO, "putdir: starting file-by-file inserts")
-        
-            lastProgressMsgTime = time.time()
 
-            # insert each file, one at a time
-            nTotal = len(manifest)
-        
-            # output status messages, and manage concurrent inserts
-            while True:
-                # get progress counts
-                nQueued = len(jobs)
-                nComplete = len(
-                                [j for j in jobs if j.isComplete()]
-                                )
-                nWaiting = nTotal - nQueued
-                nInserting = nQueued - nComplete
-        
-                # spit a progress message every 10 seconds
-                now = time.time()
-                if now - lastProgressMsgTime >= 10:
-                    lastProgressMsgTime = time.time()
-                    log(INFO,
-                        "putdir: waiting=%s inserting=%s done=%s total=%s" % (
-                            nWaiting, nInserting, nComplete, nTotal)
-                        )
-        
-                # can bail if all done
-                if nComplete == nTotal:
-                    log(INFO, "putdir: all inserts completed (or failed)")
-                    break
-        
-                # wait and go round again if concurrent inserts are maxed
-                if nInserting >= maxConcurrent:
-                    time.sleep(_pollInterval)
-                    continue
-        
-                # just go round again if manifest is empty (all remaining are in progress)
-                if len(manifest) == 0:
-                    time.sleep(_pollInterval)
-                    continue
-        
-                # got >0 waiting jobs and >0 spare slots, so we can submit a new one
-                filerec = manifest.pop(0)
-                relpath = filerec['relpath']
-                fullpath = filerec['fullpath']
-                mimetype = filerec['mimetype']
-        
-                #manifestDict[relpath] = filerec
-        
-                log(INFO, "Launching insert of %s" % relpath)
-        
-        
-                # gotta suck raw data, since we might be inserting to a remote FCP
-                # service (which means we can't use 'file=' (UploadFrom=pathmae) keyword)
-                raw = open(fullpath, "rb").read()
-        
-                print("globalMode=%s persistence=%s" % (globalMode, persistence))
-        
-                # fire up the insert job asynchronously
+        if upload_from == 'redirect' :
+            log(INFO, 'put_directoru: starting inserts')
+            for index, file in enumerate(files):
+                raw = Path(file)
                 job = self.put("CHK@",
-                               data=raw,
-                               mimetype=mimetype,
-                               async=1,
-                               waituntilsent=1,
-                               Verbosity=Verbosity,
-                               chkonly=chkonly,
-                               priority=priority,
-                               Global=globalMode,
-                               persistence=persistence,
-                               )
-                jobs.append(job)
-                filerec['job'] = job
-                job.filerec = filerec
-        
-                # wait for that job to finish if we are in the slow 'one at a time' mode
-                if not allAtOnce:
-                    job.wait()
-                    log(INFO, "Insert finished for %s" % relpath)
-        
-            # all done
-            log(INFO, "All raw files now inserted (or failed)")
-        
-        
-        # now can build up a command buffer to insert the manifest
-        msgLines = ["ClientPutComplexDir",
-                    "Identifier=%s" % id,
-                    "Verbosity=%s" % Verbosity,
-                    "MaxRetries=%s" % maxretries,
-                    "PriorityClass=%s" % priority,
-                    "URI=%s" % uriFull,
-                    "Codecs=%s" % codecs,
-                    "Persistence=%s" % persistence,
-                    "Global=%s" % globalWord,
-                    "DefaultName=index.html",
+                                data = raw.read_bytes(),
+                                mime_type = magic.from_file(str(file), mime=True).decode(),
+                                async = True,
+                                wait_until_sent = True,
+                                verbosity = verbosity,
+                                chk_only = False,
+                                priority = priority,
+                                global_queue = global_queue,
+                                persistence = persistence,
+                                maxretries=maxretries,
+                                target_file_name = file.name)
+
+                total = len(files)
+                reset = total - index
+                complete = total - reset
+
+                log(INFO, 'put_directory: waiting inserts total={0} complete{1} reset={2}'.format(total,reset,complete))
+                job.wait()
+                jobs.append({'target_uri' : job.result, 'file_full_path' : str(file), 'file_relative_path' : str(file.name),
+                             'mime_type' : magic.from_file(str(file), mime=True).decode()})
+
+        data_to_append = []
+        msg_lines = ['ClientPutComplexDir',
+                    'Identifier={0}'.format(_id),
+                    'Verbosity={0}'.format(verbosity),
+                    'MaxRetries={0}'.format(maxretries),
+                    'PriorityClass={0}'.format(priority), 
+                    'URI={0}'.format(full_uri),
+                    'Persistence={0}'.format(persistence),
+                    'Global={0}'.format(global_queue),
+                    'DefaultName={0}'.format(default_index),
                     ]
-        
-        # add each file's entry to the command buffer
-        n = 0
-        default = None
-        for job in jobs:
-            filerec = job.filerec
-            relpath = filerec['relpath']
-            fullpath = filerec['fullpath']
-            mimetype = filerec['mimetype']
-        
-            # don't add if the file failed to insert
-            if filebyfile:
-                if isinstance(filerec['job'].result, Exception):
-                    log(ERROR, "File %s failed to insert" % relpath)
+
+        if upload_from == 'redirect' :
+            for index, job in enumerate(jobs):
+            
+                if isinstance(job['target_uri'], Exception):
+                    log(ERROR, 'File {0} failed to insert'.format(job['file_relative_path']))
                     continue
-        
-            log(DETAIL, "n=%s relpath=%s" % (repr(n), repr(relpath)))
-        
-            msgLines.extend(["Files.%d.Name=%s" % (n, relpath),
-                             ])
-            if filebyfile:
-                #uri = filerec['uri'] or filerec['job'].result
-                uri = job.result
-                if not uri:
-                    raise Exception("Can't find a URI for file %s" % filerec['relpath'])
-        
-                msgLines.extend(["Files.%d.UploadFrom=redirect" % n,
-                                 "Files.%d.TargetURI=%s" % (n, uri),
-                                ])
-            else:
-                msgLines.extend(["Files.%d.UploadFrom=disk" % n,
-                                 "Files.%d.Filename=%s" % (n, fullpath),
-                                ])
-            n += 1
+
+                log(DETAIL, 'n={0} relpath={1}'.format(repr(index), repr(job['file_relative_path'])))
+
+                msg_lines.extend(['Files.{0}.Name={1}'.format(index, job['file_relative_path'])])
+
+                if not job['target_uri']:
+                    raise Exception('Can\'t find a URI for file {0}'.format(job['file_relative_path']))
+
+                msg_lines.extend(['Files.{0}.UploadFrom=redirect'.format(index),
+                                  'Files.{0}.TargetURI={1}'.format(index, job['target_uri'])])
+
+        elif upload_from == 'disk':
+            self.testDDA(Directory = directory,
+                         WantReadDirectory = True)
+            for index, file in enumerate(files):
+
+                msg_lines.extend(["Files.%d.UploadFrom=disk" % index,
+                                  'Files.%d.Name=%s' %(index, str(file.name)),
+                                  "Files.%d.Filename=%s" % (index, str(file)),
+                                  "Files.%d.Metadata.ContentType=%s" % (index, magic.from_file(str(file), mime=True).decode()),
+                                  ])
+        else:
+            for index, file in enumerate(files):
+
+                data = open(str(file), 'rb').read()
+                data_to_append.append(data)
+
+                msg_lines.extend(["Files.%d.UploadFrom=direct" % index,
+                                  'Files.%d.Name=%s' %(index, str(file.name)),
+                                  "Files.%d.DataLength=%s" % (index, str(file.stat().st_size)),
+                                  "Files.%d.Metadata.ContentType=%s" % (index, magic.from_file(str(file), mime=True).decode()),
+                                  ])
         
         # finish the command buffer
-        msgLines.append("EndMessage")
-        manifestInsertCmdBuf = "\n".join(msgLines) + "\n"
-        
+        if data_to_append:
+            msg_lines.append("Data")
+        else:
+            msg_lines.append("EndMessage")
+
+        manifest_insert_cmd_buf = b"\n".join(i.encode("utf-8") for i in msg_lines) + b"\n"
+        manifest_insert_cmd_buf += b"".join(data_to_append)
+
         # gotta log the command buffer here, since it's not sent via .put()
-        for line in msgLines:
+        for line in msg_lines:
             log(DETAIL, line)
         
-
         # now dispatch the manifest insertion job
-        if chkonly:
-            finalResult = "no_uri"
+        if chk_only:
+            return "no_uri"
         else:
-            finalResult = self._submitCmd(
-                            id, "ClientPutComplexDir",
-                            rawcmd=manifestInsertCmdBuf,
-                            async=kw.get('async', False),
-                            Global=globalMode,
-                            persistence=persistence,
-                            waituntilsent=kw.get('waituntilsent', False),
-                            callback=kw.get('callback', False),
-                            )
-        
-
-        # finally all done, return result or job ticket
-        return finalResult
-
-    
-    def modifyconfig(self, **kw):
+            if dont_compress:
+                return self.submit_cmd(
+                                _id, 'ClientPutComplexDir',
+                                rawcmd = manifest_insert_cmd_buf,
+                                async = async,
+                                Global = global_queue,
+                                persistence = persistence,
+                                wait_until_sent = wait_until_sent,
+                                DontCompress = dont_compress,
+                                callback = callback)
+            else:
+                return self.submit_cmd(
+                                _id, 'ClientPutComplexDir',
+                                rawcmd = manifest_insert_cmd_buf,
+                                async = async,
+                                Global = global_queue,
+                                persistence = persistence,
+                                wait_until_sent = wait_until_sent,
+                                DontCompress = dont_compress,
+                                Codecs = codecs,
+                                callback = callback)
+ 
+    def modify_config(self, **kw):
         """
         Modifies node configuration
         
@@ -1146,10 +1303,10 @@ class FCPNode:
                         a dict containing the response from node
             - keywords, which are the same as for the FCP message and documented in the wiki: http://wiki.freenetproject.org/FCP2p0ModifyConfig
         """
-        return self._submitCmd("__global", "ModifyConfig", **kw)
+        return self.submit_cmd("__global", "ModifyConfig", **kw)
     
 
-    def getconfig(self, **kw):
+    def get_config(self, **kw):
         """
         Gets node configuration
         
@@ -1169,51 +1326,49 @@ class FCPNode:
             - other keywords, which are the same as for the FCP message and documented in the wiki: http://wiki.freenetproject.org/FCP2p0GetConfig
         """
         
-        return self._submitCmd("__global", "GetConfig", **kw)
+        return self.submit_cmd("__global", "GetConfig", **kw)
     
 
-    def invertprivate(self, privatekey):
+    def invert_private(self, private_key):
         """
         Converts an SSK or USK private key to a public equivalent
         """
-        isstr = isinstance(privatekey, str)
-        if isstr:
-            privatekey = privatekey.encode("utf-8")
-            
-        privatekey = privatekey.strip().split(b"freenet:")[-1]
-    
-        isUsk = privatekey.startswith(b"USK@")
+        is_str = type(private_key) is str
+
+        if is_str:
+            private_key = private_key.encode('utf-8')
+                
+        is_usk = private_key.startswith(b'USK@')
         
-        if isUsk:
-            privatekey = privatekey.replace(b"USK@", b"SSK@")
+        if is_usk:
+            private_key = private_key.replace(b'USK@', b'SSK@')
     
-        bits = privatekey.split(b"/", 1)
-        mainUri = bits[0].decode("utf-8")
+        bits = private_key.split(b'/', 1)
+        mainUri = bits[0].decode('utf-8')
     
-        uri = self.put(mainUri+"/foo", data=b"bar", chkonly=1)
+        uri = self.put(mainUri+'/foo', data=b'bar', chk_only = True)
     
-        uri = uri.split("/")[0].encode("utf-8")
-        uri = b"/".join([uri] + bits[1:])
+        uri = uri.split('/')[0].encode('utf-8')
+        uri = b'/'.join([uri] + bits[1:])
     
-        if isUsk:
-            uri = uri.replace(b"SSK@", b"USK@")
+        if is_usk:
+            uri = uri.replace(b'SSK@', b'USK@')
 
-        if isstr:
-            return uri.decode("utf-8")
+        if is_str:
+            return uri.decode('utf-8')
         return uri
-    
 
-    def redirect(self, srcKey, destKey, **kw):
+    def redirect(self, src_key, des_key, **kw):
         """
         Inserts key srcKey, as a redirect to destKey.
         srcKey must be a KSK, or a path-less SSK or USK (and not a CHK)
         """
-        uri = self.put(srcKey, redirect=destKey, **kw)
+        uri = self.put(src_key, redirect=des_key, **kw)
     
         return uri
     
 
-    def genchk(self, **kw):
+    def gen_chk(self, **kw):
         """
         Returns the CHK URI under which a data item would be
         inserted.
@@ -1225,10 +1380,10 @@ class FCPNode:
         Keywords - optional:
             - mimetype - defaults to text/plain - THIS AFFECTS THE CHK!!
         """
-        return self.put(chkonly=True, **kw)
+        return self.put(chk_only=True, **kw)
     
 
-    def listpeers(self, **kw):
+    def list_peers(self, **kw):
         """
         Gets the list of peers from the node
         
@@ -1247,10 +1402,10 @@ class FCPNode:
             - WithVolatile - default False - if True, returns a peer's volatile info
         """
         
-        return self._submitCmd("__global", "ListPeers", **kw)
+        return self.submit_cmd("__global", "ListPeers", **kw)
     
 
-    def listpeernotes(self, **kw):
+    def list_peer_notes(self, **kw):
         """
         Gets the list of peer notes for a given peer from the node
         
@@ -1268,10 +1423,10 @@ class FCPNode:
             - NodeIdentifier - one of name, identity or IP:port for the desired peer
         """
         
-        return self._submitCmd("__global", "ListPeerNotes", **kw)
+        return self.submit_cmd("__global", "ListPeerNotes", **kw)
     
 
-    def refstats(self, **kw):
+    def ref_stats(self, **kw):
         """
         Gets node reference and possibly node statistics.
         
@@ -1291,7 +1446,7 @@ class FCPNode:
             - WithVolatile - default False - if True, returns a node's volatile info
         """
         # The GetNode answer has no id, so we have to use __global.
-        return self._submitCmd("__global", "GetNode", **kw)
+        return self.submit_cmd("__global", "GetNode", **kw)
     
 
     def testDDA(self, **kw):
@@ -1300,7 +1455,7 @@ class FCPNode:
         
         Keywords:
             - callback - if given, this should be a callable which accepts 2
-              arguments:
+                arguments:
                   - status - will be one of 'successful', 'failed' or 'pending'
                   - value - depends on status:
                       - if status is 'successful', this will contain the value
@@ -1308,62 +1463,87 @@ class FCPNode:
                       - if status is 'failed' or 'pending', this will contain
                         a dict containing the response from node
             - Directory - directory to test
-            - WithReadDirectory - default False - if True, want node to read from directory for a put operation
-            - WithWriteDirectory - default False - if True, want node to write to directory for a get operation
+            - WantReadDirectory - default False - if True, want node to read from directory for a put operation
+            - WantReadDirectory - default False - if True, want node to write to directory for a get operation
         """
         # cache the testDDA:
-        DDAkey = (kw["Directory"], kw.get("WantReadDirectory", False), kw.get("WantWriteDirectory", False))
+        
+        directory = kw.get('Directory', None)
+
         try:
-            return self.testedDDA[DDAkey]
+            assert type(directory) is str
+        except AssertionError:
+            raise AssertionError('directory must be path str')
+
+        if not Path(directory).exists():
+            raise FileNotFoundError('directory not found')
+
+        want_read_directory = kw.get('WantReadDirectory', False)
+        try:
+            assert type(want_read_directory) is bool
+        except AssertionError:
+            raise AssertionError('want_read_directory must be bool')
+
+        want_write_directory = kw.get('WantWriteDirectory', False)
+        try:
+            assert type(want_write_directory) is bool
+        except AssertionError:
+            raise AssertionError('want_write_directory must be bool')
+
+        DDAkey = (directory, want_read_directory, want_write_directory)
+
+        try:
+            return self.tested_DDA[DDAkey]
         except KeyError:
             pass # we actually have to test this dir.
+
         try:
-            requestResult = self._submitCmd("__global", "TestDDARequest", **kw)
+            opts = {'Directory' : directory, 
+                    'WantReadDirectory' : want_read_directory, 
+                    'WantWriteDirectory' : want_write_directory}
+
+            request_result = self.submit_cmd('__global', 'TestDDARequest', **opts)
         except FCPProtocolError as e:
             self._log(DETAIL, str(e))
             return False
-        writeFilename = None
-        kw = {}
-        kw['Directory'] = requestResult['Directory']
-        if 'ReadFilename' in requestResult:
-            readFilename = requestResult['ReadFilename']
 
-            try:
-                readFile = open(readFilename, 'rb')
-                readFileContents = readFile.read().decode('utf-8')
-                readFile.close()
-            except FileNotFoundError:
-                readFileContents = ''
+        write_filename = None
+        opts = {}
+        opts['Directory'] = request_result['Directory']
+        if 'ReadFilename' in request_result:
+            read_filename = request_result['ReadFilename']
+            read_file = Path(read_filename)
 
-            kw['ReadFilename'] = readFilename
-            kw['ReadContent'] = readFileContents
+            if read_file.exists():
+                read_file_contents = read_file.read_text('utf-8')
+            else:
+                read_file_contents = ''
+
+            opts['ReadFilename'] = read_filename
+            opts['ReadContent'] = read_file_contents
             
-        if 'WriteFilename' in requestResult and 'ContentToWrite' in requestResult:
-            writeFilename = requestResult['WriteFilename']
-            contentToWrite = requestResult['ContentToWrite'].encode('utf-8')
+        if 'WriteFilename' in request_result and 'ContentToWrite' in request_result:
+            write_filename = request_result['WriteFilename']
+            content_to_write = request_result['ContentToWrite'].encode('utf-8')
+            write_file = pathlib.Path(write_filename)
 
-            try:
-                writeFile = open(writeFilename, "w+b")
-                writeFile.write(contentToWrite)
-                writeFile.close()
-                writeFileStatObject = os.stat(writeFilename)
-                writeFileMode = writeFileStatObject.st_mode
-                os.chmod(writeFilename, writeFileMode | stat.S_IREAD | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
-            except FileNotFoundError:
-                pass
-            
-        responseResult = self._submitCmd("__global", "TestDDAResponse", **kw)
-        if writeFilename is not None:
-            try:
-                os.remove(writeFilename)
-            except OSError:
-                pass
+            if write_file.exists():
+                write_file.write_bytes(content_to_write.encode('utf-8'))
+                write_file_stat_object = os.stat(write_filename)
+                write_file_mode = write_file_stat_object.st_mode
+                os.chmod(write_filename, write_file_mode | stat.S_IREAD | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+                
+        response_result = self.submit_cmd("__global", "TestDDAResponse", **opts)
+
+        if write_filename is not None:
+            file_to_delete = pathlib.Path(write_filename)
+            file_to_delete.unlink()
+
         # cache this result, so we do not calculate it twice.
-        self.testedDDA[DDAkey] = responseResult
-        return responseResult
-    
+        self.tested_DDA[DDAkey] = response_result
+        return response_result
 
-    def addpeer(self, **kw):
+    def add_peer(self, **kw):
         """
         Add a peer to the node
         
@@ -1383,10 +1563,10 @@ class FCPNode:
             - kwdict - If neither File nor URL are provided, the fields of a noderef can be passed in the form of a Python dictionary using the kwdict keyword
         """
         
-        return self._submitCmd("__global", "AddPeer", **kw)
+        return self.submit_cmd("__global", "AddPeer", **kw)
     
 
-    def listpeer(self, **kw):
+    def list_peer(self, **kw):
         """
         Modify settings on one of the node's peers
         
@@ -1404,10 +1584,10 @@ class FCPNode:
             - NodeIdentifier - one of name (except for opennet peers), identity or IP:port for the desired peer
         """
         
-        return self._submitCmd("__global", "ListPeer", **kw)
+        return self.submit_cmd("__global", "ListPeer", **kw)
     
 
-    def modifypeer(self, **kw):
+    def modify_peer(self, **kw):
         """
         Modify settings on one of the node's peers
         
@@ -1427,10 +1607,10 @@ class FCPNode:
             - NodeIdentifier - one of name, identity or IP:port for the desired peer
         """
         
-        return self._submitCmd("__global", "ModifyPeer", **kw)
+        return self.submit_cmd("__global", "ModifyPeer", **kw)
     
 
-    def modifypeernote(self, **kw):
+    def modify_peer_note(self, **kw):
         """
         Modify settings on one of the node's peers
         
@@ -1450,10 +1630,10 @@ class FCPNode:
             - PeerNoteType - code number of peer note type: currently only private peer note is supported by the node with code number 1 
         """
         
-        return self._submitCmd("__global", "ModifyPeerNote", **kw)
+        return self.submit_cmd("__global", "ModifyPeerNote", **kw)
     
 
-    def removepeer(self, **kw):
+    def remove_peer(self, **kw):
         """
         Removes a peer from the node
         
@@ -1471,7 +1651,7 @@ class FCPNode:
             - NodeIdentifier - one of name, identity or IP:port for the desired peer
         """
         
-        return self._submitCmd("__global", "RemovePeer", **kw)
+        return self.submit_cmd("__global", "RemovePeer", **kw)
     
 
     # methods for namesites
@@ -1534,7 +1714,7 @@ class FCPNode:
         """
         if not privuri:
             privuri = self.genkey()[1]
-        puburi = self.invertprivate(privuri)
+        puburi = self.invert_private(privuri)
         
         privuri = self.namesiteProcessUri(privuri)
         puburi = self.namesiteProcessUri(puburi)
@@ -1604,7 +1784,7 @@ class FCPNode:
             async=True,
             )
     
-        self.refreshPersistentRequests()
+        self.refresh_persistent_requests()
     
 
     def namesiteDelRecord(self, localname, domain):
@@ -1733,57 +1913,57 @@ class FCPNode:
     
 
     # high level client methods
-    def listenGlobal(self, **kw):
+    def listen_global(self, **kw):
         """
         Enable listening on global queue
         """
-        self._submitCmd(None, "WatchGlobal", Enabled="true", **kw)
+        self.submit_cmd(None, "WatchGlobal", Enabled="true", **kw)
     
 
-    def ignoreGlobal(self, **kw):
+    def ignore_global(self, **kw):
         """
         Stop listening on global queue
         """
-        self._submitCmd(None, "WatchGlobal", Enabled="false", **kw)
+        self.submit_cmd(None, "WatchGlobal", Enabled="false", **kw)
     
 
-    def purgePersistentJobs(self):
+    def purge_persistent_jobs(self):
         """
         Cancels all persistent jobs in one go
         """
-        for job in self.getPersistentJobs():
+        for job in self.get_persistent_jobs():
             job.cancel()
     
 
-    def getAllJobs(self):
+    def get_all_jobs(self):
         """
         Returns a list of persistent jobs, excluding global jobs
         """
         return list(self.jobs.values())
     
 
-    def getPersistentJobs(self):
+    def get_persistent_jobs(self):
         """
         Returns a list of persistent jobs, excluding global jobs
         """
-        return [j for j in list(self.jobs.values()) if j.isPersistent and not j.isGlobal]
+        return [j for j in list(self.jobs.values()) if j.is_persistent and not j.is_global]
     
 
-    def getGlobalJobs(self):
+    def get_global_jobs(self):
         """
         Returns a list of global jobs
         """
-        return [j for j in list(self.jobs.values()) if j.isGlobal]
+        return [j for j in list(self.jobs.values()) if j.is_global]
     
 
-    def getTransientJobs(self):
+    def get_transient_jobs(self):
         """
         Returns a list of non-persistent, non-global jobs
         """
-        return [j for j in list(self.jobs.values()) if not j.isPersistent]
+        return [j for j in list(self.jobs.values()) if not j.is_persistent]
     
 
-    def refreshPersistentRequests(self, **kw):
+    def refresh_persistent_requests(self, **kw):
         """
         Sends a ListPersistentRequests to node, to ensure that
         our records of persistent requests are up to date.
@@ -1802,8 +1982,8 @@ class FCPNode:
         # format the request
         opts = {}
     
-        id = '__global'
-        opts['Identifier'] = id
+        _id = '__global'
+        opts['Identifier'] = _id
     
         opts['async'] = kw.pop('async', False)
         if 'callback' in kw:
@@ -1811,50 +1991,45 @@ class FCPNode:
     
         # ---------------------------------
         # now enqueue the request
-        return self._submitCmd(id, "ListPersistentRequests", **opts)
+        return self.submit_cmd(_id, "ListPersistentRequests", **opts)
     
 
-    def clearGlobalJob(self, id):
+    def clear_global_job(self, _id):
         """
         Removes a job from the jobs queue
         """
-        self._submitCmd(id, "RemovePersistentRequest",
-                        Identifier=id, Global=True, async=True, waituntilsent=True)
+        self.submit_cmd(_id, "RemovePersistentRequest",
+                        Identifier=_id, Global=True, async=True, wait_until_sent=True)
     
 
-    def getSocketTimeout(self):
+    def get_socket_timeout(self):
         """
-        Gets the socketTimeout for future socket calls;
+        Gets the socket_timeout for future socket calls;
         returns None if not supported by Python version
         """
-        try:
-            return self.socket.gettimeout()
-        except Exception as e:
-            # Socket timeout setting is not available until Python 2.3, so ignore exceptions
-            pass
-        return None
+
+        return self.socket.gettimeout()
+
     
 
-    def setSocketTimeout(self, socketTimeout):
+    def set_socket_timeout(self, socket_timeout):
         """
-        Sets the socketTimeout for future socket calls
+        Sets the socket_timeout for future socket calls
         
         >>> node = FCPNode()
-        >>> timeout = node.getSocketTimeout()
+        >>> timeout = node.getsocket_timeout()
         >>> newtimeout = 1800
-        >>> node.setSocketTimeout(newtimeout)
-        >>> node.getSocketTimeout()
+        >>> node.setsocket_timeout(newtimeout)
+        >>> node.getsocket_timeout()
         1800.0
         """
-        self.socketTimeout = socketTimeout
-        try:
-            self.socket.settimeout(self.socketTimeout)
-        except Exception as e:
-            # Socket timeout setting is not available until Python 2.3, so ignore exceptions
-            pass
+
+        self.socket_timeout = socket_timeout
+        self.socket.settimeout(self.socket_timeout)
+
     
 
-    def getVerbosity(self):
+    def get_verbosity(self):
         """
         Gets the verbosity for future logging calls
 
@@ -1868,7 +2043,7 @@ class FCPNode:
         return self.verbosity
     
 
-    def setVerbosity(self, verbosity):
+    def set_verbosity(self, verbosity):
         """
         Sets the verbosity for future logging calls
         """
@@ -1892,16 +2067,16 @@ class FCPNode:
         self.running = False
     
         # give the manager thread a chance to bail out
-        time.sleep(pollTimeout * 3)
+        time.sleep(POLL_TIMEOUT * 3)
     
         # wait for mgr thread to quit
         log(DETAIL, "shutdown: waiting for manager thread to terminate")
-        self.shutdownLock.acquire()
+        self.shutdown_lock.acquire()
         log(DETAIL, "shutdown: manager thread terminated")
     
         # shut down FCP connection
         if hasattr(self, 'socket'):
-            if not self.noCloseSocket:
+            if not self.no_close_socket:
                 self.socket.close()
                 del self.socket
     
@@ -1919,85 +2094,85 @@ class FCPNode:
         Keywords:
             - async - whether to do this call asynchronously, and
               return a JobTicket object, default False
-            - waituntilsent - whether to block until this command has been sent
+            - wait_until_sent - whether to block until this command has been sent
               to the node, default False
         """
-        return self._submitCmd("__global", "Shutdown", **kw)
+        return self.submit_cmd("__global", "Shutdown", **kw)
 
         
     # methods for manager thread
-    def _mgrThread(self):
+    def __mgr_thread(self):
         """
         This thread is the nucleus of pyFreenet, and coordinates incoming
         client commands and incoming node responses
         """
         log = self._log
     
-        self.shutdownLock.acquire()
+        self.shutdown_lock.acquire()
     
         log(DETAIL, "FCPNode: manager thread starting")
         try:
             while self.running:
     
-                log(NOISY, "_mgrThread: Top of manager thread")
+                log(NOISY, "__mgr_thread: Top of manager thread")
     
                 # try for incoming messages from node
-                log(NOISY, "_mgrThread: Testing for incoming message")
-                if self._msgIncoming():
-                    log(DEBUG, "_mgrThread: Retrieving incoming message")
-                    msg = self._rxMsg()
-                    log(DEBUG, "_mgrThread: Got incoming message, dispatching")
-                    self._on_rxMsg(msg)
-                    log(DEBUG, "_mgrThread: back from on_rxMsg")
+                log(NOISY, "__mgr_thread: Testing for incoming message")
+                if self.__msg_incoming():
+                    log(DEBUG, "__mgr_thread: Retrieving incoming message")
+                    msg = self.__rx_msg()
+                    log(DEBUG, "__mgr_thread: Got incoming message, dispatching")
+                    self.__on_rx_msg(msg)
+                    log(DEBUG, "__mgr_thread: back from on_rx_msg")
                 else:
-                    log(NOISY, "_mgrThread: No incoming message from node")
+                    log(NOISY, "__mgr_thread: No incoming message from node")
         
                 # try for incoming requests from clients
-                log(NOISY, "_mgrThread: Testing for client req")
+                log(NOISY, "__mgr_thread: Testing for client req")
                 try:
-                    req = self.clientReqQueue.get(True, pollTimeout)
-                    log(DEBUG, "_mgrThread: Got client req, dispatching")
-                    self._on_clientReq(req)
-                    log(DEBUG, "_mgrThread: Back from on_clientReq")
+                    req = self.client_req_queue.get(True, POLL_TIMEOUT)
+                    log(DEBUG, "__mgr_thread: Got client req, dispatching")
+                    self.__on_client_req(req)
+                    log(DEBUG, "__mgr_thread: Back from on_clientReq")
                 except queue.Empty:
-                    log(NOISY, "_mgrThread: No incoming client req")
+                    log(NOISY, "__mgr_thread: No incoming client req")
                     pass
     
-            self._log(DETAIL, "_mgrThread: Manager thread terminated normally")
+            self._log(DETAIL, "__mgr_thread: Manager thread terminated normally")
     
         except Exception as e:
             traceback.print_exc()
-            self._log(CRITICAL, "_mgrThread: manager thread crashed")
+            self._log(CRITICAL, "__mgr_thread: manager thread crashed")
     
             # send the exception to all waiting jobs
             for id, job in list(self.jobs.items()):
-                job._putResult(e)
+                job._put_result(e)
             
             # send the exception to all queued jobs
             while True:
                 try:
-                    job = self.clientReqQueue.get(True, pollTimeout)
-                    job._putResult(e)
+                    job = self.client_req_queue.get(True, POLL_TIMEOUT)
+                    job._put_result(e)
                 except queue.Empty:
-                    log(NOISY, "_mgrThread: No incoming client req")
+                    log(NOISY, "__mgr_thread: No incoming client req")
                     break
     
-        self.shutdownLock.release()
+        self.shutdown_lock.release()
     
 
-    def _msgIncoming(self):
+    def __msg_incoming(self):
         """
         Returns True if a message is coming in from the node
         """
-        return len(select.select([self.socket], [], [], pollTimeout)[0]) > 0
+        return len(select.select([self.socket], [], [], POLL_TIMEOUT)[0]) > 0
     
 
-    def _submitCmd(self, id, cmd, **kw):
+    def submit_cmd(self, _id, cmd, **kw):
         """
         Submits a command for execution
         
         Arguments:
-            - id - the command identifier
+            - _id - the command identifier
             - cmd - the command name, such as 'ClientPut'
         
         Keywords:
@@ -2007,11 +2182,11 @@ class FCPNode:
               Status is one of 'successful', 'pending' or 'failed'.
               value is the primitive return value if successful, or the raw
               node message if pending or failed
-            - followRedirect - follow a redirect if true, otherwise fail the get
+            - follow_redirect - follow a redirect if true, otherwise fail the get
             - rawcmd - a raw command buffer to send directly
             - options specific to command such as 'URI'
             - timeout - timeout in seconds for job completion, default 1 year
-            - waituntilsent - whether to block until this command has been sent
+            - wait_until_sent - whether to block until this command has been sent
               to the node, default False
             - keep - whether to keep the job on our jobs list after it completes,
               default False
@@ -2025,45 +2200,47 @@ class FCPNode:
         >>> n = fcp.node.FCPNode()
         >>> cmd = "ClientPut"
         >>> jobid = "id2291160822224650"
-        >>> opts = {'Metadata.ContentType': 'text/html', 'async': False, 'UploadFrom': 'direct', 'Verbosity': 0, 'Global': 'false', 'URI': 'CHK@', 'keep': False, 'DontCompress': 'false', 'MaxRetries': -1, 'timeout': 31536000, 'Codecs': 'GZIP, BZIP2, LZMA, LZMA_NEW', 'GetCHKOnly': 'true', 'RealTimeFlag': 'false', 'waituntilsent': False, 'Identifier': jobid, 'Data': '<!DOCTYPE html>\\n<html>\\n<head>\\n<title>Sitemap for freenet-plugin-bare</title>\\n</head>\\n<body>\\n<h1>Sitemap for freenet-plugin-bare</h1>\\nThis listing was automatically generated and inserted by freesitemgr\\n<br><br>\\n<table cellspacing=0 cellpadding=2 border=0>\\n<tr>\\n<td><b>Size</b></td>\\n<td><b>Mimetype</b></td>\\n<td><b>Name</b></td>\\n</tr>\\n<tr>\\n<td>19211</td>\\n<td>text/html</td>\\n<td><a href="index.html">index.html</a></td>\\n</tr>\\n</table>\\n<h2>Keys of large, separately inserted files</h2>\\n<pre>\\n</pre></body></html>\\n', 'PriorityClass': 3, 'Persistence': 'connection', 'TargetFilename': 'sitemap.html'}
-        >>> n._submitCmd(jobid, cmd, **opts)
+        >>> opts = {'Metadata.ContentType': 'text/html', 'async': False, 'UploadFrom': 'direct', 'Verbosity': 0, 'Global': 'false', 'URI': 'CHK@', 'keep': False, 'DontCompress': 'false', 'MaxRetries': -1, 'timeout': 31536000, 'Codecs': 'GZIP, BZIP2, LZMA, LZMA_NEW', 'GetCHKOnly': 'true', 'RealTimeFlag': 'false', 'wait_until_sent': False, 'Identifier': jobid, 'Data': '<!DOCTYPE html>\\n<html>\\n<head>\\n<title>Sitemap for freenet-plugin-bare</title>\\n</head>\\n<body>\\n<h1>Sitemap for freenet-plugin-bare</h1>\\nThis listing was automatically generated and inserted by freesitemgr\\n<br><br>\\n<table cellspacing=0 cellpadding=2 border=0>\\n<tr>\\n<td><b>Size</b></td>\\n<td><b>Mimetype</b></td>\\n<td><b>Name</b></td>\\n</tr>\\n<tr>\\n<td>19211</td>\\n<td>text/html</td>\\n<td><a href="index.html">index.html</a></td>\\n</tr>\\n</table>\\n<h2>Keys of large, separately inserted files</h2>\\n<pre>\\n</pre></body></html>\\n', 'PriorityClass': 3, 'Persistence': 'connection', 'TargetFilename': 'sitemap.html'}
+        >>> n.submit_cmd(jobid, cmd, **opts)
         'CHK@FR~anQPhpw7lZjxl96o1b875tem~5xExPTiSa6K3Wus,yuGOWhpqFY5N9i~N4BjM0Oh6Bk~Kkb7sE4l8GAsdBEs,AAMC--8/sitemap.html'
-        >>> # n._submitCmd(id=None, cmd='WatchGlobal', **{'Enabled': 'true'})
+        >>> # n.submit_cmd(id=None, cmd='WatchGlobal', **{'Enabled': 'true'})
         
         """
-        if not self.nodeIsAlive:
-            raise FCPNodeFailure("%s:%s: node closed connection" % (cmd, id))
+        if not self.node_is_alive:
+            raise FCPNodeFailure('{0}:{1}: node closed connection'.format(cmd, _id))
 
         # if identifier is not given explicitly in the options, we
         # need to add it to ensure that the replies find matching
         # jobs.
-        if not "Identifier" in kw and not "identifier" in kw:
-            kw["Identifier"] = id
-        
+        if not "Identifier":
+            kw["Identifier"] = _id
+
         log = self._log
 
         if self.verbosity >= DEBUG:
-            log(DEBUG, "_submitCmd: id=" + repr(id) + ", cmd=" + repr(cmd) + ", **" + repr(kw))
+            log(DEBUG, "submit_cmd: _id=" + repr(_id) + ", cmd=" + repr(cmd) + ", **" + repr(kw))
     
         async = kw.pop('async', False)
-        followRedirect = kw.pop('followRedirect', True)
+        follow_redirect = kw.pop('follow_redirect', True)
         stream = kw.pop('stream', None)
-        waituntilsent = kw.pop('waituntilsent', False)
-        keepjob = kw.pop('keep', False)
+        wait_until_sent = kw.pop('wait_until_sent', False)
+        keep_job = kw.pop('keep', False)
         timeout = kw.pop('timeout', ONE_YEAR)
+        
         if( "kwdict" in kw):
             kwdict = kw[ "kwdict" ]
             del kw[ "kwdict" ]
             for key in list(kwdict.keys()):
                 kw[ key ] = kwdict[ key ]
+        
         job = JobTicket(
-            self, id, cmd, kw,
-            verbosity=self.verbosity, logger=self._log, keep=keepjob,
+            self, _id, cmd, kw,
+            verbosity=self.verbosity, logger=self._log, keep=keep_job,
             stream=stream)
     
-        log(DEBUG, "_submitCmd: timeout=%s" % timeout)
+        log(DEBUG, "submit_cmd: timeout=%s" % timeout)
         
-        job.followRedirect = followRedirect
+        job.follow_redirect = follow_redirect
     
         if cmd == 'ClientGet' and 'URI' in kw:
             job.uri = kw['URI']
@@ -2071,26 +2248,24 @@ class FCPNode:
         if cmd == 'ClientPut' and 'Metadata.ContentType' in kw:
             job.mimetype = kw['Metadata.ContentType']
     
-        self.clientReqQueue.put(job)
+        self.client_req_queue.put(job)
     
-        # log(DEBUG, "_submitCmd: id='%s' cmd='%s' kw=%s" % (id, cmd, # truncate long commands
+        # log(DEBUG, "submit_cmd: _id='%s' cmd='%s' kw=%s" % (id, cmd, # truncate long commands
         #                                                    str([(k,str(kw.get(k, ""))[:128])
         #                                                         for k 
         #                                                         in kw])))
-    
-    
-        if async:
-            if waituntilsent:
-                job.waitTillReqSent()
-            return job
-        elif cmd in ['WatchGlobal', "RemovePersistentRequest"]:
-            return
-        else:
-            log(DETAIL, "Waiting on job")
-            return job.wait(timeout)
-    
 
-    def _on_clientReq(self, job):
+        if async:
+            if wait_until_sent:
+                job.wait_till_req_sent()
+            return job
+        elif cmd in ['WatchGlobal', 'RemovePersistentRequest']:
+            return
+
+        log(DETAIL, "Waiting on job")
+        return job.wait(timeout)
+
+    def __on_client_req(self, job):
         """
         takes an incoming request job from client and transmits it to
         the fcp port, and also registers it so the manager thread
@@ -2103,18 +2278,18 @@ class FCPNode:
         # register the req
         if cmd != 'WatchGlobal':
             self.jobs[id] = job
-            self._log(DEBUG, "_on_clientReq: cmd=%s id=%s lock=%s" % (
+            self._log(DEBUG, "__on_client_req: cmd=%s id=%s lock=%s" % (
                 cmd, repr(id), job.lock))
         
         # now can send, since we're the only one who will
-        self._txMsg(cmd, **kw)
+        self._tx_msg(cmd, **kw)
     
-        job.timeQueued = int(time.time())
+        job.time_queued = int(time.time())
     
-        job.reqSentLock.release()
+        job.req_sent_lock.release()
     
 
-    def _on_rxMsg(self, msg):
+    def __on_rx_msg(self, msg):
         """
         Handles incoming messages from node
         
@@ -2123,21 +2298,19 @@ class FCPNode:
         """
         log = self._log
     
+        # ArneBab => http://freenet.mantishub.io/view.php?id=6890
+
         # find the job this relates to
-        id = msg.get('Identifier', '__global')
-        # FIXME: this is a hack to get TestDDARequest to fail gracefully
-        # FIXME: See https://bugs.freenetproject.org/view.php?id=6890
-        if id.startswith('/'):
-            id = '__global'
+        _id = msg.get('Identifier', '__global')
     
         hdr = msg['header']
     
-        job = self.jobs.get(id, None)
+        job = self.jobs.get(_id, None)
         if not job:
             # we have a global job and/or persistent job from last connection
-            log(DETAIL, "***** Got %s from unknown job id %s" % (hdr, repr(id)))
-            job = JobTicket(self, id, hdr, msg)
-            self.jobs[id] = job
+            log(DETAIL, "***** Got %s from unknown job _id %s" % (hdr, repr(_id)))
+            job = JobTicket(self, _id, hdr, msg)
+            self.jobs[_id] = job
     
         # action from here depends on what kind of message we got
     
@@ -2148,10 +2321,10 @@ class FCPNode:
             # got requested keys back
             keys = (msg['RequestURI'], msg['InsertURI'])
             job.callback('successful', keys)
-            job._putResult(keys)
+            job._put_result(keys)
     
             # and remove job from queue
-            self.jobs.pop(id, None)
+            self.jobs.pop(_id, None)
             return
     
         # -----------------------------
@@ -2168,13 +2341,13 @@ class FCPNode:
                 #resp['file'] = file
                 result = (mimetype, job.kw['Filename'], msg)
                 job.callback('successful', result)
-                job._putResult(result)
+                job._put_result(result)
                 return
     
             elif job.kw['ReturnType'] == 'none':
                 result = (mimetype, 1, msg)
                 job.callback('successful', result)
-                job._putResult(result)
+                job._put_result(result)
                 return
     
             # otherwise, we're expecting an AllData and will react to it then
@@ -2186,16 +2359,16 @@ class FCPNode:
                     # FIXME: this is a hack, clean it up
                     log(INFO, "Request was persistent")
                     if not hasattr(job, "gotPersistentDataFound"):
-                        if job.isGlobal:
-                            isGlobal = "true"
+                        if job.is_global:
+                            is_global = "true"
                         else:
-                            isGlobal = "false"
+                            is_global = "false"
                         job.gotPersistentDataFound = True
                         log(INFO, "  --> sending GetRequestStatus")
-                        self._txMsg("GetRequestStatus",
+                        self._tx_msg("GetRequestStatus",
                                     Identifier=job.kw['Identifier'],
                                     Persistence=msg.get("Persistence", "connection"),
-                                    Global=isGlobal,
+                                    Global=is_global,
                                     )
     
                 job.callback('pending', msg)
@@ -2226,30 +2399,30 @@ class FCPNode:
         if hdr == 'AllData':
             result = (job.mimetype, msg['Data'], msg)
             job.callback('successful', result)
-            job._putResult(result)
+            job._put_result(result)
             return
 
         if hdr == 'GetFailed':
             # see if it's just a redirect problem
-            if job.followRedirect and (msg.get('ShortCodeDescription', None) == "New URI" or msg.get('Code', None) == 27):
+            if job.follow_redirect and (msg.get('ShortCodeDescription', None) == "New URI" or msg.get('Code', None) == 27):
                 uri = msg['RedirectURI']
                 job.kw['URI'] = uri
-                job.kw['id'] = self._getUniqueId();
-                self._txMsg(job.cmd, **job.kw)
+                job.kw['id'] = self.__get_unique_id();
+                self._tx_msg(job.cmd, **job.kw)
                 log(DETAIL, "Redirect to %s" % uri)
                 return
             # see if it's just a TOO_MANY_PATH_COMPONENTS redirect
-            if job.followRedirect and (msg.get('ShortCodeDescription', None) == "Too many path components" or msg.get('Code', None) == 11):
+            if job.follow_redirect and (msg.get('ShortCodeDescription', None) == "Too many path components" or msg.get('Code', None) == 11):
                 uri = msg['RedirectURI']
                 job.kw['URI'] = uri
-                job.kw['id'] = self._getUniqueId();
-                self._txMsg(job.cmd, **job.kw)
+                job.kw['id'] = self.__get_unique_id();
+                self._tx_msg(job.cmd, **job.kw)
                 log(DETAIL, "Redirect to %s" % uri)
                 return
     
             # return an exception
             job.callback("failed", msg)
-            job._putResult(FCPGetFailed(msg))
+            job._put_result(FCPGetFailed(msg))
             return
     
         # -----------------------------
@@ -2268,7 +2441,7 @@ class FCPNode:
             # bail here if no data coming back
             if job.kw.get('GetCHKOnly', False) == 'true':
                 # done - only wanted a CHK
-                job._putResult(newUri)
+                job._put_result(newUri)
                 return
     
         if hdr == 'PutSuccessful':
@@ -2276,14 +2449,14 @@ class FCPNode:
                 log(ERROR, "message {} without 'URI'. This is very likely a bug in Freenet. Check whether you have files in uploads or downloads without URI (clickable link).".format(hdr))
             else:
                 result = msg['URI']
-                job._putResult(result)
+                job._put_result(result)
                 job.callback('successful', result)
             # print "*** PUTSUCCESSFUL"
             return
     
         if hdr == 'PutFailed':
             job.callback('failed', msg)
-            job._putResult(FCPPutFailed(msg))
+            job._put_result(FCPPutFailed(msg))
             return
         
         if hdr == 'PutFetchable':
@@ -2300,25 +2473,25 @@ class FCPNode:
         if hdr == 'ConfigData':
             # return all the data recieved
             job.callback('successful', msg)
-            job._putResult(msg)
+            job._put_result(msg)
     
             # remove job from queue
-            self.jobs.pop(id, None)
+            self.jobs.pop(_id, None)
             return
     
         # -----------------------------
         # handle progress messages
     
         if hdr == 'StartedCompression':
-            job.callback('pending', msg)
+            job.callback('started_compress', msg)
             return
     
         if hdr == 'FinishedCompression':
-            job.callback('pending', msg)
+            job.callback('finished_compress', msg)
             return
     
         if hdr == 'SimpleProgress':
-            job.callback('pending', msg)
+            job.callback('progress', msg)
             return
     
         if hdr == 'SendingToNetwork':
@@ -2341,57 +2514,57 @@ class FCPNode:
         # handle LoadPlugin replies
         
         if hdr == 'PluginInfo':
-            job._appendMsg(msg)
+            job._append_msg(msg)
             job.callback('successful', job.msgs)
-            job._putResult(job.msgs)
+            job._put_result(job.msgs)
             return
         
         # -----------------------------
         # handle FCPPluginMessage replies
         
         if hdr == 'FCPPluginReply':
-            job._appendMsg(msg)
+            job._append_msg(msg)
             job.callback('successful', job.msgs)
-            job._putResult(job.msgs)
+            job._put_result(job.msgs)
             return   
         
         # -----------------------------
         # handle peer management messages
         
         if hdr == 'EndListPeers':
-            job._appendMsg(msg)
+            job._append_msg(msg)
             job.callback('successful', job.msgs)
-            job._putResult(job.msgs)
+            job._put_result(job.msgs)
             return   
         
         if hdr == 'Peer':
             if(job.cmd == "ListPeers"):
                 job.callback('pending', msg)
-                job._appendMsg(msg)
+                job._append_msg(msg)
             else:
                 job.callback('successful', msg)
-                job._putResult(msg)
+                job._put_result(msg)
             return
         
         if hdr == 'PeerRemoved':
-            job._appendMsg(msg)
+            job._append_msg(msg)
             job.callback('successful', job.msgs)
-            job._putResult(job.msgs)
+            job._put_result(job.msgs)
             return   
         
         if hdr == 'UnknownNodeIdentifier':
-            job._appendMsg(msg)
+            job._append_msg(msg)
             job.callback('failed', job.msgs)
-            job._putResult(job.msgs)
+            job._put_result(job.msgs)
             return   
     
         # -----------------------------
         # handle peer note management messages
         
         if hdr == 'EndListPeerNotes':
-            job._appendMsg(msg)
+            job._append_msg(msg)
             job.callback('successful', job.msgs)
-            job._putResult(job.msgs)
+            job._put_result(job.msgs)
 
 
             return   
@@ -2399,16 +2572,16 @@ class FCPNode:
         if hdr == 'PeerNote':
             if(job.cmd == "ListPeerNotes"):
                 job.callback('pending', msg)
-                job._appendMsg(msg)
+                job._append_msg(msg)
             else:
                 job.callback('successful', msg)
-                job._putResult(msg)
+                job._put_result(msg)
             return
         
         if hdr == 'UnknownPeerNoteType':
-            job._appendMsg(msg)
+            job._append_msg(msg)
             job.callback('failed', job.msgs)
-            job._putResult(job.msgs)
+            job._put_result(job.msgs)
             return   
     
         # -----------------------------
@@ -2416,28 +2589,28 @@ class FCPNode:
     
         if hdr == 'PersistentGet':
             job.callback('pending', msg)
-            job._appendMsg(msg)
+            job._append_msg(msg)
             return
     
         if hdr == 'PersistentPut':
             job.callback('pending', msg)
-            job._appendMsg(msg)
+            job._append_msg(msg)
             return
     
         if hdr == 'PersistentPutDir':
             job.callback('pending', msg)
-            job._appendMsg(msg)
+            job._append_msg(msg)
             return
     
         if hdr == 'EndListPersistentRequests':
-            job._appendMsg(msg)
+            job._append_msg(msg)
             job.callback('successful', job.msgs)
-            job._putResult(job.msgs)
+            job._put_result(job.msgs)
             return
         
         if hdr == 'PersistentRequestRemoved':
-            if id in self.jobs:
-                del self.jobs[id]
+            if _id in self.jobs:
+                del self.jobs[_id]
             return
         
         # ----------------------------- 
@@ -2471,19 +2644,19 @@ class FCPNode:
         if hdr == 'TestDDAReply':
             # return all the data recieved
             job.callback('successful', msg)
-            job._putResult(msg)
+            job._put_result(msg)
     
             # remove job from queue
-            self.jobs.pop(id, None)
+            self.jobs.pop(_id, None)
             return
         
         if hdr == 'TestDDAComplete':
             # return all the data recieved
             job.callback('successful', msg)
-            job._putResult(msg)
+            job._put_result(msg)
     
             # remove job from queue
-            self.jobs.pop(id, None)
+            self.jobs.pop(_id, None)
             return
     
         # -----------------------------
@@ -2491,10 +2664,10 @@ class FCPNode:
         if hdr == 'NodeData':
             # return all the data recieved
             job.callback('successful', msg)
-            job._putResult(msg)
+            job._put_result(msg)
     
             # remove job from queue
-            self.jobs.pop(id, None)
+            self.jobs.pop(_id, None)
             return
     
         # -----------------------------
@@ -2502,13 +2675,13 @@ class FCPNode:
     
         if hdr == 'ProtocolError':
             job.callback('failed', msg)
-            job._putResult(FCPProtocolError(msg))
+            job._put_result(FCPProtocolError(msg))
             return
     
         if hdr == 'IdentifierCollision':
-            log(ERROR, "IdentifierCollision on id %s ???" % id)
+            log(ERROR, "IdentifierCollision on _id %s ???" % _id)
             job.callback('failed', msg)
-            job._putResult(Exception("Duplicate job identifier %s" % id))
+            job._put_result(Exception("Duplicate job identifier %s" % _id))
             return
 
         # Ignore informational headers (since 1254)
@@ -2520,7 +2693,7 @@ class FCPNode:
     
         log(ERROR, "Unknown message type from node: %s" % hdr)
         job.callback('failed', msg)
-        job._putResult(FCPException(msg))
+        job._put_result(FCPException(msg))
         return
 
     
@@ -2528,64 +2701,39 @@ class FCPNode:
     # low level noce comms methods
     
 
-    def _hello(self):
+    def __hello(self):
         """
         perform the initial FCP protocol handshake
         """
-        self._txMsg("ClientHello", 
+        self._tx_msg("ClientHello", 
                          Name=self.name,
                          ExpectedVersion=expectedVersion)
-        
-        resp = self._rxMsg()
-        if("Version" in resp):
-          self.nodeVersion = resp[ "Version" ];
-        if("FCPVersion" in resp):
-          self.nodeFCPVersion = resp[ "FCPVersion" ];
-        if("Build" in resp):
-          try:
-            self.nodeBuild = int( resp[ "Build" ] );
-          except Exception as msg:
-            pass;
-        else:
-          nodeVersionFields = self.nodeVersion.split( "," );
-          if( len( nodeVersionFields ) == 4 ):
-            try:
-              self.nodeBuild = int( nodeVersionFields[ 3 ] );
-            except Exception as msg:
-              pass;
-        if("Revision" in resp):
-          try:
-            self.nodeRevision = int( resp[ "Revision" ] );
-          except Exception as msg:
-            pass;
-        if("ExtBuild" in resp):
-          try:
-            self.nodeExtBuild = int( resp[ "ExtBuild" ] );
-          except Exception as msg:
-            pass;
-        if("Revision" in resp):
-          try:
-            self.nodeExtRevision = int( resp[ "ExtRevision" ] );
-          except Exception as msg:
-            pass;
-        if("Testnet" in resp):
-          if( "true" == resp[ "Testnet" ] ):
-            self.nodeIsTestnet = True;
-          else:
-            self.nodeIsTestnet = False;
-        if("ConnectionIdentifier" in resp):
-            self.connectionidentifier = resp[ "ConnectionIdentifier" ]
-        try:
-            self.compressionCodecs = self._parseCompressionCodecs(
-                resp [ "CompressionCodecs" ])
-        except (KeyError, IndexError, ValueError):
-            pass
 
+        resp = self.__rx_msg()
+
+        self.node_version = resp['Version'] if 'Version' in resp else None
+
+        self.node_fcp_version = resp['FCPVersion'] if 'FCPVersion' in resp else None
+
+        self.node_build = resp['Build'] if 'Build' in resp else None
+
+        self.node_revision = resp['Revision'] if 'Revision' in resp else None
             
-        return resp
-    
+        self.node_ext_build = resp['ExtBuild'] if('ExtBuild' in resp) else None
 
-    def _parseCompressionCodecs(self, CompressionCodecsString):
+        self.node_ext_revision = resp['ExtRevision'] if 'Revision' in resp else None
+            
+        self.node_is_tfestnet = True if 'Testnet' in resp else False
+        
+        self.connectionidentifier = resp['ConnectionIdentifier'] if 'ConnectionIdentifier' in resp else None
+
+        
+        self.compression_codecs = self.__parse_compression_codecs(
+            resp ['CompressionCodecs']) if 'CompressionCodecs' in resp else COMPRESSION_CODECS
+
+        return resp
+
+    def __parse_compression_codecs(self, compression_codecs_string):
         """
         Turn the CompressionCodecsString returned by the node into a list
         of name and number of the codec.
@@ -2597,10 +2745,10 @@ class FCPNode:
         return [(name, int(number[:-1])) 
                 for name, number 
                 in [i.split("(") 
-                    for i in CompressionCodecsString.split(
+                    for i in compression_codecs_string.split(
                             " - ")[1].split(", ")]]
 
-    def defaultCompressionCodecsString(self):
+    def default_compression_codecs_string(self):
         """
         Turn the CompressionCodecs into a string accepted by the node.
 
@@ -2608,18 +2756,16 @@ class FCPNode:
         @return: "GZIP, BZIP2, LZMA" (example)
 
         """
-        return ", ".join([name for name, num in self.compressionCodecs])
+        return ", ".join([name for name, num in self.compression_codecs])
 
-    def _getUniqueId(self):
+    def __get_unique_id(self):
         """
         Allocate a unique ID for a request
         """
-        timenum = int( time.time() * 1000000 );
-        randnum = random.randint( 0, timenum );
-        return "id" + str( timenum + randnum );
+        return 'id_{0}'.format(str( uuid.uuid4()))
     
 
-    def _txMsg(self, msgType, **kw):
+    def _tx_msg(self, msgType, **kw):
         """
         low level message send
         
@@ -2690,7 +2836,7 @@ class FCPNode:
         self.socket.sendall(raw)
     
 
-    def _rxMsg(self):
+    def __rx_msg(self):
         """
         Receives and returns a message as a dict
         
@@ -2712,7 +2858,7 @@ class FCPNode:
                 if chunk:
                     chunks += chunk
                 else:
-                    self.nodeIsAlive = False
+                    self.node_is_alive = False
                     raise FCPNodeFailure("FCP socket closed by node")
                 remaining -= chunklen
                 if remaining > 0:
@@ -2778,7 +2924,7 @@ class FCPNode:
                     line = line.decode('utf-8')
                     k, v = line.split("=", 1)
                 except:
-                    log(ERROR, "_rxMsg: barfed splitting '%s'" % repr(line))
+                    log(ERROR, "__rx_msg: barfed splitting '%s'" % repr(line))
                     raise
     
                 # attempt int conversion
@@ -2811,10 +2957,8 @@ class FCPNode:
             msglines = msg.split("\n")
             for msgline in msglines:
                 self.logfunc(msgline)
-    
 
-
-class JobTicket:
+class JobTicket(object):
     """
     A JobTicket is an object returned to clients making
     asynchronous requests. It puts them in control of how
@@ -2826,46 +2970,47 @@ class JobTicket:
         - receive a callback upon completion
         
     Attributes of interest:
-        - isPersistent - True if job is persistent
-        - isGlobal - True if job is global
-        - followRedirect - follow a redirect if true, otherwise fail the get
+        - is_persistent - True if job is persistent
+        - is_global - True if job is global
+        - follow_redirect - follow a redirect if true, otherwise fail the get
         - value - value returned upon completion, or None if not complete
         - node - the node this job belongs to
-        - id - the job Identifier
+        - _id - the job Identifier
         - cmd - the FCP message header word
         - kw - the keywords in the FCP header
         - msgs - any messages received from node in connection
           to this job
     """
 
-    def __init__(self, node, id, cmd, kw, **opts):
+    def __init__(self, node, _id, cmd, kw, **opts):
         """
         You should never instantiate a JobTicket object yourself
         """
         self.node = node
-        self.id = id
+        self.id = _id
         self.cmd = cmd
-    
-        self.verbosity = opts.get('verbosity', ERROR)
-        self._log = opts.get('logger', self.defaultLogger)
+
+        self.verbosity = opts.get('Verbosity', ERROR)
+        self._log = opts.get('logger', self.default_logger)
         self.keep = opts.get('keep', False)
         self.stream = opts.get('stream', None)
-        self.followRedirect = opts.get('followRedirect', True)
-    
+        self.follow_redirect = opts.get('follow_redirect', True)
+
+        print(node, " ", kw.get("Persistence", "connection"))
         # find out if persistent
-        if (kw.get("Persistent", "connection") != "connection" or
-            kw.get("PersistenceType", "connection") != "connection"):
-            self.isPersistent = True
+        if kw.get("Persistence", "connection") != "connection":
+            self.is_persistent = True
+
         else:
-            self.isPersistent = False
-    
-        if kw.get('Global', 'false') == 'true':
-            self.isGlobal = True
+            self.is_persistent = False
+
+        if kw.get('Global', False) == True:
+            self.is_global = True
         else:
-            self.isGlobal = False
-    
+            self.is_global = False
+
         self.kw = kw
-    
+
         self.msgs = []
     
         callback = kw.pop('callback', None)
@@ -2873,20 +3018,19 @@ class JobTicket:
             self.callback = callback
     
         self.timeout = int(kw.pop('timeout', 86400*365))
-        self.timeQueued = int(time.time())
+        self.time_queued = int(time.time())
         self.timeSent = None
     
         self.lock = threading.Lock()
-        #print "** JobTicket.__init__: lock=%s" % self.lock
     
         self.lock.acquire()
         self.result = None
     
-        self.reqSentLock = threading.Lock()
-        self.reqSentLock.acquire()
+        self.req_sent_lock = threading.Lock()
+        self.req_sent_lock.acquire()
     
 
-    def isComplete(self):
+    def is_complete(self):
         """
         Returns True if the job has been completed
         """
@@ -2907,13 +3051,13 @@ class JobTicket:
             while not self.lock.acquire(False):
                 time.sleep(_pollInterval)
             self.lock.release()
-            return self.getResult()
+            return self.get_result()
     
         # wait for timeout
         then = int(time.time())
     
         # ensure command has been sent, wait if not
-        while not self.reqSentLock.acquire(False):
+        while not self.req_sent_lock.acquire(False):
     
             # how long have we waited?
             elapsed = int(time.time()) - then
@@ -2963,17 +3107,17 @@ class JobTicket:
         self.lock.release()
     
         # and we have a result
-        return self.getResult()
+        return self.get_result()
     
 
-    def waitTillReqSent(self):
+    def wait_till_req_sent(self):
         """
         Waits till the request has been sent to node
         """
-        self.reqSentLock.acquire()
+        self.req_sent_lock.acquire()
     
 
-    def getResult(self):
+    def get_result(self):
         """
         Returns result of job, or None if job still not complete
     
@@ -2981,8 +3125,8 @@ class JobTicket:
         """
         if isinstance(self.result, Exception):
             raise self.result
-        else:
-            return self.result
+
+        return self.result
     
 
     def callback(self, status, value):
@@ -2999,7 +3143,7 @@ class JobTicket:
         
         Does nothing if the job was not persistent
         """
-        if not self.isPersistent:
+        if not self.is_persistent:
             return
     
         # remove from node's jobs lists
@@ -3009,28 +3153,27 @@ class JobTicket:
             pass
         
         # send the cancel
-        if self.isGlobal:
-            isGlobal = "true"
+        if self.is_global:
+            is_global = True
         else:
-            isGlobal = "False"
+            is_global = False
     
-        self.node._txMsg("RemovePersistentRequest",
-                         Global=isGlobal,
+        self.node._tx_msg("RemovePersistentRequest",
+                         Global=is_global,
                          Identifier=self.id)
-    
 
-    def _appendMsg(self, msg):
+    def _append_msg(self, msg):
         self.msgs.append(msg)
     
 
-    def _putResult(self, result):
+    def _put_result(self, result):
         """
         Called by manager thread to indicate job is complete,
         and submit a result to be picked up by client
         """
         self.result = result
     
-        if not (self.keep or self.isPersistent or self.isGlobal):
+        if not (self.keep or self.is_persistent or self.is_global):
             try:
                 del self.node.jobs[self.id]
             except:
@@ -3054,7 +3197,7 @@ class JobTicket:
         return "<FCP job %s:%s%s" % (self.id, self.cmd, uri)
     
 
-    def defaultLogger(self, level, msg):
+    def default_logger(self, level, msg):
         
         if level > self.verbosity:
             return
@@ -3121,7 +3264,7 @@ def readdir(dirpath, prefix='', gethashes=False):
     >>> correct == readdir(tempdir)
     True
     >>> res = readdir(tempdir, gethashes=True)
-    >>> res[0]["hash"] == hashFile(testfile)
+    >>> res[0]["hash"] == hash_file(testfile)
     True
     """
     
@@ -3151,20 +3294,20 @@ def readdir(dirpath, prefix='', gethashes=False):
                      'mimetype':guessMimetype(f)
                      }
             if gethashes:
-                entry['hash'] = hashFile(fullpath)
+                entry['hash'] = hash_file(fullpath)
             entries.append(entry)
     entries.sort(key=lambda k: k['relpath'])
     
     return entries
 
-def hashFile(path):
+def hash_file(path):
     """
     returns an SHA(1) hash of a file's contents
 
     >>> oslevelid, filepath = tempfile.mkstemp(text=True)
     >>> with open(filepath, "w") as f:
     ...     f.write("test")
-    >>> hashFile(filepath) == hashlib.sha1("test").hexdigest()
+    >>> hash_file(filepath) == hashlib.sha1("test").hexdigest()
     True
     """
     raw = open(path, "rb").read()
@@ -3207,7 +3350,7 @@ def guessMimetype(filename):
 
 _re_slugify = re.compile('[^\w\s\.-]', re.UNICODE)
 _re_slugify_multidashes = re.compile('[-\s]+', re.UNICODE)
-def toUrlsafe(filename):
+def to_url_safe(filename):
     """Make a filename url-safe, keeping only the basename and killing all
 potentially unfitting characters.
     
@@ -3219,21 +3362,21 @@ potentially unfitting characters.
     return str(filename)
 
 
-def uriIsPrivate(uri):
+def uri_is_private(uri):
     """
     analyses an SSK URI, and determines if it is an SSK or USK private key
 
     for details see https://wiki.freenetproject.org/Signed_Subspace_Key
 
-    >>> uriIsPrivate("SSK@~Udj39wzRUN4J-Kqn1aWN8kJyHL6d44VSyWoqSjL60A,iAtIH8348UGKfs8lW3mw0lm0D9WLwtsIzZhvMWelpK0,AQACAAE/")
+    >>> uri_is_private("SSK@~Udj39wzRUN4J-Kqn1aWN8kJyHL6d44VSyWoqSjL60A,iAtIH8348UGKfs8lW3mw0lm0D9WLwtsIzZhvMWelpK0,AQACAAE/")
     False
-    >>> uriIsPrivate("SSK@R-skbNbiXqWkqj8FPDTusWyk7u8HLvbdysyRY3eY9A0,iAtIH8348UGKfs8lW3mw0lm0D9WLwtsIzZhvMWelpK0,AQECAAE/")
+    >>> uri_is_private("SSK@R-skbNbiXqWkqj8FPDTusWyk7u8HLvbdysyRY3eY9A0,iAtIH8348UGKfs8lW3mw0lm0D9WLwtsIzZhvMWelpK0,AQECAAE/")
     True
-    >>> uriIsPrivate("USK@AIcCHvrGspY-7J73J3VR-Td3DuPvw3IqCyjjRK6EvJol,hEvqa41cm72Wc9O1AjZ0OoDU9JVGAvHDDswIE68pT7M,AQECAAE/test.R1/0")
+    >>> uri_is_private("USK@AIcCHvrGspY-7J73J3VR-Td3DuPvw3IqCyjjRK6EvJol,hEvqa41cm72Wc9O1AjZ0OoDU9JVGAvHDDswIE68pT7M,AQECAAE/test.R1/0")
     True
-    >>> uriIsPrivate("KSK@AIcCHvrGspY-7J73J3VR-Td3DuPvw3IqCyjjRK6EvJol,hEvqa41cm72Wc9O1AjZ0OoDU9JVGAvHDDswIE68pT7M,AQECAAE/test.R1/0")
+    >>> uri_is_private("KSK@AIcCHvrGspY-7J73J3VR-Td3DuPvw3IqCyjjRK6EvJol,hEvqa41cm72Wc9O1AjZ0OoDU9JVGAvHDDswIE68pT7M,AQECAAE/test.R1/0")
     False
-    >>> uriIsPrivate("SSK@JhtPxdPLx30sRN0c5S2Hhcsif~Yqy1lsGiAx5Wkq7Lo,-e0kLAjmmclSR7uL0TN901tS3iSx2-21Id8tUp4tyzg,AQECAAE/")
+    >>> uri_is_private("SSK@JhtPxdPLx30sRN0c5S2Hhcsif~Yqy1lsGiAx5Wkq7Lo,-e0kLAjmmclSR7uL0TN901tS3iSx2-21Id8tUp4tyzg,AQECAAE/")
     True
     """
     # strip leading stuff
@@ -3252,19 +3395,22 @@ def uriIsPrivate(uri):
         extra = extra.split("/")[0]
     extra += "/"
     extrabytes = base64.decodestring(extra)
-    isprivate = ord(extrabytes[1])
-    if isprivate:
+
+    is_private = ord(extrabytes[1])
+    
+    if is_private:
         return True
+
     return False
 
-def parseTime(t):
+def parse_time(t):
     """
     Parses a time value, recognising suffices like 'm' for minutes,
     's' for seconds, 'h' for hours, 'd' for days, 'w' for weeks,
     'M' for months.
     
     >>> endings = {'s':1, 'm':60, 'h':60*60, 'd':60*60*24, 'w':60*60*24*7, 'M':60*60*24*30}
-    >>> not False in [endings[i]*3 == parseTime("3"+i) for i in endings]
+    >>> not False in [endings[i]*3 == parse_time("3"+i) for i in endings]
     True
 
     Returns time value in seconds
@@ -3327,8 +3473,6 @@ def base64decode(enc):
     
     return raw
 
-
-
 def _base30hex(integer):
     """Turn an integer into a simple lowercase base30hex encoding."""
     base30 = "0123456789abcdefghijklmnopqrst"
@@ -3344,6 +3488,7 @@ def _test():
     tests = doctest.testmod()
     if tests.failed:
         return "☹"*tests.failed
+
     return "^_^ (" + _base30hex(tests.attempted) + ")"
         
 

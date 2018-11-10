@@ -26,6 +26,7 @@ from threading import Lock
 import traceback
 from queue import Queue
 from hashlib import md5, sha1
+import magic
 
 from errno import *
 from stat import *
@@ -45,7 +46,7 @@ from errno import *
 import fcp3 as fcp
 
 from fcp3.xmlobject import XMLFile
-from fcp3.node import guessMimetype, base64encode, base64decode, uriIsPrivate
+from fcp3.node import guessMimetype, base64encode, base64decode, uri_is_private
 
 #@-node:imports
 #@+node:globals
@@ -53,8 +54,8 @@ argv = sys.argv
 argc = len(argv)
 progname = argv[0]
 
-fcpHost = fcp.node.defaultFCPHost
-fcpPort = fcp.node.defaultFCPPort
+fcpHost = fcp.node.FCP_HOST
+fcpPort = fcp.node.FCP_PORT
 
 defaultVerbosity = fcp.DETAIL
 
@@ -674,7 +675,7 @@ class FreenetBaseFS:
                 try:
                     self.log("release: inserting %s" % uri)
                 
-                    mimetype = fcp.node.guessMimetype(path)
+                    mimetype = magic.from_file(path, mime=True).decode()
                     data = rec.data
                 
                     # empty the pseudo-file till a result is through
@@ -1121,7 +1122,7 @@ class FreenetBaseFS:
     
         # determine CHKs for all these jobs
         for rec in fileRecs:
-            rec.mimetype = guessMimetype(rec.path)
+            rec.mimetype = magic.from_file(rec.path, mime=True).decode()
             rec.uri = node.put(
                 "CHK@file",
                 data=rec.data,

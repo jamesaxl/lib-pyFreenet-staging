@@ -25,38 +25,50 @@ new persistent SiteMgr class
 #@+others
 #@+node:imports
 import sys, os, os.path, io, threading, traceback, pprint, time, stat, json
+import configparser
+from pathlib import Path
 
 import fcp3 as fcp
 from fcp3 import CRITICAL, ERROR, INFO, DETAIL, DEBUG, NOISY
-from fcp3.node import hashFile
+from fcp3.node import hash_file
 
 #@-node:imports
 #@+node:globals
 defaultBaseDir = os.path.join(os.path.expanduser('~'), ".freesitemgr")
 
+BASE_DIR = '{0}/.config/freenet-barnamy'.format(str(Path.home()))
+CONFIG_FILE = '{0}/freesitemgr.conf'.format(CONFIG_DIR)
+
 maxretries = -1
+MAXRETRIES = -1
 
 defaultMaxConcurrent = 10
+MAX_CONCURRENT = 10
 
 testMode = False
 #testMode = True
 
 defaultPriority = 3
+PRIORITY = 3
 
 defaultMaxManifestSizeBytes = 1024*1024*2 # 2.0 MiB: As used by the freenet default dir inserter. Reduced by 512 bytes per redirect. TODO: Add a larger side-container for additional medium-size files like images. Doing this here, because here we know what is linked in the index file.
 defaultMaxNumberSeparateFiles = 512 # ad hoq - my node sometimes dies at 500 simultaneous uploads. This is half the space in the estimated size of the manifest.
 
+MAX_MANIFEST_SIZE_BYTES = 1024*1024*2
+MAX_NUMBER_SEPARATE_FILES = 512
 
 version = 1
+VERSION = 1
 
 minVersion = 0
+MIN_VERSION = 0
 
 class Hell(Exception):
     """Something smells wrong here..."""
 
 #@-node:globals
 #@+node:class SiteMgr
-class SiteMgr:
+class SiteMgr(object):
     """
     New nuclear-war-resistant Freesite insertion class
     """
@@ -525,7 +537,7 @@ class SiteState:
                 if not rec.get('hash', ''):
                     needToSave = True
                     try:
-                        #rec['hash'] = hashFile(rec['path'])
+                        #rec['hash'] = hash_file(rec['path'])
                         rec['hash'] = ''
                     except:
                         #traceback.print_exc()
@@ -1066,7 +1078,7 @@ class SiteState:
             rec['path'] = f['fullpath'].decode(enc)
             rec['name'] = f['relpath'].decode(enc)
             rec['mimetype'] = f['mimetype']
-            rec['hash'] = hashFile(rec['path'])
+            rec['hash'] = hash_file(rec['path'])
             rec['sizebytes'] = getFileSize(rec['path'])
             rec['uri'] = ''
             rec['id'] = ''
